@@ -58,13 +58,17 @@ class App:
         ttk.Label(top, textvariable=self.mode_var, font=("", 11, "bold"),
                   foreground="#1a73e8").pack(side=tk.LEFT, padx=(4, 0))
 
-        # 中部：三个图片展示框
+        # 中部：三个图片展示框（grid 三列 uniform 等宽 = 严格各 1/3，纵向填满）
         cards = ttk.Frame(self.root, padding=(8, 0))
         cards.pack(fill=tk.BOTH, expand=True)
+        self.cards = cards
+        cards.rowconfigure(0, weight=1)
+        for i in range(3):
+            cards.columnconfigure(i, weight=1, uniform="panels")
         self.boxes = []
         for i, title in enumerate(self.titles):
             frame = ttk.Frame(cards, relief=tk.GROOVE, borderwidth=2, padding=4)
-            frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+            frame.grid(row=0, column=i, sticky="nsew", padx=4)
             ttk.Label(frame, text=title).pack()
             # 容器用 Frame（width/height 为像素单位）；Label 的 width/height 是字符单位，
             # 直接设 300 会把窗口撑爆（≈2100px+），只剩第一个框可见
