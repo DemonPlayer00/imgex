@@ -95,6 +95,36 @@ jobs:
           assert np.array_equal(cv2.imread('/tmp/smoke_dec.png'), A), 'round-trip mismatch'
           print('SMOKE OK: encode/decode round-trip matches original')
           EOF
+      - name: Smoke test per-channel codec (gray/RGBA/channel-independence via built binary)
+        run: |
+          python - <<'EOF'
+          import numpy as np, cv2, subprocess
+          rng = np.random.default_rng(1)
+
+          def rt(name, A, mod_fn):
+              # A: HxW or HxWxN uint8；用 PNG 保存（cv2 写灰度/4 通道均保留通道数）
+              cv2.imwrite(f'/tmp/pc_{name}_A.png', A)
+              B = A.copy(); mod_fn(B)
+              cv2.imwrite(f'/tmp/pc_{name}_B.png', B)
+              subprocess.run(['./dist/imgex', '-o', f'/tmp/pc_{name}_A.png', '-c', f'/tmp/pc_{name}_B.png',
+                              '-p', 'test', '-O', f'/tmp/pc_{name}_enc.png'], check=True, capture_output=True)
+              subprocess.run(['./dist/imgex', '-c', f'/tmp/pc_{name}_enc.png', '-p', 'test',
+                              '-O', f'/tmp/pc_{name}_dec.png'], check=True, capture_output=True)
+              got = cv2.imread(f'/tmp/pc_{name}_dec.png', cv2.IMREAD_UNCHANGED)
+              assert got.ndim == A.ndim, f'{name}: channel count changed ({got.ndim} vs {A.ndim})'
+              assert np.array_equal(got, A), f'{name}: round-trip mismatch'
+              print(f'SMOKE OK: {name} ({A.ndim}d, shape={A.shape}) round-trip')
+
+          # 灰度 1 通道：输出必须仍为 2D
+          A = rng.integers(0, 256, (64, 64), dtype=np.uint8)
+          rt('gray', A, lambda B: B[10:30, 20:40].__setitem__(slice(None), rng.integers(0, 256, (20, 20), dtype=np.uint8)))
+          # RGBA 4 通道：输出必须仍为 4 通道
+          A = rng.integers(0, 256, (64, 64, 4), dtype=np.uint8)
+          rt('rgba', A, lambda B: B[10:30, 20:40].__setitem__(slice(None), rng.integers(0, 256, (20, 20, 4), dtype=np.uint8)))
+          # 单通道独立：只改 R（通道 2），B/G 必须零差异；往返一致
+          A = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+          rt('indep', A, lambda B: B[5:15, 5:15, 2].__setitem__(slice(None), B[5:15, 5:15, 2] ^ 0x55))
+          EOF
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
