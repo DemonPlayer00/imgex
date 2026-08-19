@@ -144,19 +144,23 @@ def _noise_map(height: int, width: int, seed: int) -> np.ndarray:
 
 
 def _apply_noise(img: np.ndarray, noise: np.ndarray) -> np.ndarray:
-    """mod-256 加法：v = (v0 + n) mod 256（uint8 环绕，可逆）。"""
+    """XOR 低 4 位：v = v0 XOR n，偏移恒 ≤15（<16），无条件可逆。
+
+    不使用 mod-256 加法——v0 接近 255 时环绕会使像素突变（可达 ±241），
+    破坏 0~15 微扰伪装；XOR 只翻转低 4 位，高 4 位不变，视觉偏移恒小。
+    """
     n = noise.astype(np.uint8)
     if img.ndim == 3 and n.ndim == 2:
         n = n[:, :, None]
-    return img + n
+    return img ^ n
 
 
 def _remove_noise(img: np.ndarray, noise: np.ndarray) -> np.ndarray:
-    """mod-256 减法：v0 = (v - n) mod 256。"""
+    """XOR 自逆：v0 = v XOR n（加噪与去噪同一操作）。"""
     n = noise.astype(np.uint8)
     if img.ndim == 3 and n.ndim == 2:
         n = n[:, :, None]
-    return img - n
+    return img ^ n
 
 
 def _payload_start(seed: int, n_slots: int) -> int:
@@ -442,7 +446,7 @@ def encode(original_path, coded_path, password=None, output_path=None):
     added = theory_vals + d_img
     new_vals = np.where(added > 255, theory_vals - d_img, added).astype(np.uint8)
     expanded[yy, xx] = new_vals
-    # v3：内图边缘加种子噪声（扩展区不加噪，镜像基底不受影响；mod-256 可逆）
+    # v3：内图边缘加种子噪声（扩展区不加噪，镜像基底不受影响；XOR 低 4 位，偏移 ≤15）
     expanded[k:height + k, k:width + k] = _apply_noise(
         expanded[k:height + k, k:width + k], _noise_map(height, width, seed_noise))
 
@@ -490,7 +494,7 @@ def decode(coded_path, password=None, output_path=None):
     seed_start = _derive_seed(password, b"start")
     for k in range(1, max_k + 1):
         inner = img[k:eh - k, k:ew - k]
-        # v3：先还原内图噪声（种子噪声 mod-256 减法），再重建理论镜像
+        # v3：先还原内图噪声（种子噪声 XOR 自逆），再重建理论镜像
         inner_clean = _remove_noise(inner, _noise_map(inner.shape[0], inner.shape[1], seed_noise))
         theory = expand_image(inner_clean, k)  # 与 img 同尺寸的理论镜像扩展图
         height, width = inner.shape[:2]
