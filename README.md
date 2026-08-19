@@ -86,6 +86,10 @@ imgex
 - 解码必须使用与编码相同的密码，否则校验失败
 - 编码图请以 PNG 等无损格式保存，有损压缩会破坏扩展区数据
 
+## 许可证
+
+本项目采用 **GNU GPLv3 或更高版本**（GPL-3.0-or-later）授权。完整文本见 [LICENSE](LICENSE)。
+
 ## 关联项目
 
 本软件是 **OpenArt 许可证/计划**的基础设施之一。如果您感兴趣，请查看 https://github.com/DemonPlayer00/OpenArt-Licenses-Library
