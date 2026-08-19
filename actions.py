@@ -8,11 +8,8 @@ import numpy as np
 
 # 默认密码（未通过 -p 提供时使用；其 SHA-256 摘要作为写入扩展区的校验码）
 DEFAULT_PASSWORD = "477a3d43f692aeaf1c7f40c0c91bffde3e2e638d8e90c668422373ee82a18521"
-# payload 格式版本：1 = 旧版（3 通道整像素原值），2 = 新版（每通道独立编解码）
-PAYLOAD_VERSION_V1 = 1
-PAYLOAD_VERSION_V2 = 2
-# 每像素参与写入的通道数（BGR）
-_CHANNELS = 3
+# payload 格式版本（每通道独立编解码）
+PAYLOAD_VERSION = 2
 
 
 def _imread(path):
@@ -79,29 +76,10 @@ def calc_expand_pixels(width: int, height: int, need: int) -> int:
 
 # ---------- 位拆分 / 合并 ----------
 
-def split_byte(value: int):
-    """将 0~255 按位奇偶拆为两个 0~15 的值。
-
-    奇数位（bit 1,3,5,7）组成第一个值，偶数位（bit 2,4,6,8）组成第二个值。
-    """
-    odd = (((value >> 7) & 1) << 3) | (((value >> 5) & 1) << 2) | (((value >> 3) & 1) << 1) | ((value >> 1) & 1)
-    even = (((value >> 6) & 1) << 3) | (((value >> 4) & 1) << 2) | (((value >> 2) & 1) << 1) | (value & 1)
-    return odd, even
-
-
-def merge_nibbles(odd: int, even: int) -> int:
-    """split_byte 的逆运算：两个 0~15 的值合并回 0~255。"""
-    value = 0
-    for i in range(4):
-        value |= ((odd >> i) & 1) << (2 * i + 1)
-        value |= ((even >> i) & 1) << (2 * i)
-    return value
-
-
 def _payload_to_nibbles(payload: bytes) -> np.ndarray:
     """向量化位拆分：payload 每字节按位奇偶拆为两个 0~15 值（先奇位后偶位）。
 
-    与逐字节 split_byte 结果完全一致。
+    奇位（bit 1,3,5,7）在前，偶位（bit 2,4,6,8）在后。
     """
     arr = np.frombuffer(payload, dtype=np.uint8)
     odd = np.zeros(len(arr), dtype=np.uint8)
@@ -118,7 +96,7 @@ def _payload_to_nibbles(payload: bytes) -> np.ndarray:
 def _nibbles_to_bytes(nibbles: np.ndarray) -> bytes:
     """向量化位合并：nibble 流按 (奇位值, 偶位值) 成对合并回字节。
 
-    与逐字节 merge_nibbles 结果完全一致；尾部奇数个 nibble 丢弃。
+    尾部奇数个 nibble 丢弃。
     """
     n = len(nibbles) // 2 * 2
     odd = nibbles[0:n:2]
@@ -145,70 +123,8 @@ def expand_coords(height: int, width: int, k: int):
 
 # ---------- RLE 区间 ----------
 
-def scan_runs(mask: np.ndarray, direction: int):
-    """扫描连续不一致区间。
-
-    direction=0：逐行扫描；direction=1：逐列扫描。
-    返回 [(index, [(start, end), ...]), ...]，仅包含非空行/列。
-    """
-    m = mask if direction == 0 else mask.T
-    entries = []
-    for i in range(m.shape[0]):
-        runs = []
-        j = 0
-        n = m.shape[1]
-        row = m[i]
-        while j < n:
-            if row[j]:
-                s = j
-                while j < n and row[j]:
-                    j += 1
-                runs.append((s, j - 1))
-            else:
-                j += 1
-        if runs:
-            entries.append((i, runs))
-    return entries
-
-
-def serialize_entries(entries, direction: int) -> bytes:
-    """区间数据序列化：方向(1B) + 非空行/列数(4B) + 每项[索引(4B), 区间数(4B), 区间*(起点(4B), 终点(4B))]。"""
-    out = bytearray([direction])
-    out += len(entries).to_bytes(4, "big")
-    for idx, runs in entries:
-        out += idx.to_bytes(4, "big")
-        out += len(runs).to_bytes(4, "big")
-        for s, e in runs:
-            out += s.to_bytes(4, "big")
-            out += e.to_bytes(4, "big")
-    return bytes(out)
-
-
 def parse_entries(data: bytes, pos: int):
-    """serialize_entries 的逆运算（v1 交错格式）。返回 (direction, entries, 结束位置)。"""
-    direction = data[pos]
-    pos += 1
-    count = int.from_bytes(data[pos:pos + 4], "big")
-    pos += 4
-    entries = []
-    for _ in range(count):
-        idx = int.from_bytes(data[pos:pos + 4], "big")
-        pos += 4
-        n = int.from_bytes(data[pos:pos + 4], "big")
-        pos += 4
-        runs = []
-        for _ in range(n):
-            s = int.from_bytes(data[pos:pos + 4], "big")
-            pos += 4
-            e = int.from_bytes(data[pos:pos + 4], "big")
-            pos += 4
-            runs.append((s, e))
-        entries.append((idx, runs))
-    return direction, entries, pos
-
-
-def parse_entries_v2(data: bytes, pos: int):
-    """v2 段解析（_rle_encode_channel 的分离布局）：
+    """段解析（_rle_encode_channel 的分离布局）：
     方向(1B) + 行数(4B) + 行头区[idx,n_runs]×rows(8B×rows) + run区[s,e]×Σn(8B×Σn)。
     返回 (direction, entries, 结束位置)。全 numpy 读头区/run区，逐行组装 entries。
     """
@@ -335,27 +251,8 @@ def _apply_channels_parallel(restored, sections, directions):
                     range(nc)))
 
 
-def serialize_values(image: np.ndarray, entries, direction: int) -> bytes:
-    """按区间扫描顺序逐像素取原图的 BGR 值（每像素 3 字节，向量化）。"""
-    ys, xs = _entries_to_coords(entries, direction)
-    if ys is None:
-        return b""
-    return image[ys, xs].tobytes()
-
-
-def apply_values(image: np.ndarray, entries, direction: int, values: bytes):
-    """把原值流按区间顺序写回 image（还原原图，向量化）。返回消费的字节数。"""
-    ys, xs = _entries_to_coords(entries, direction)
-    if ys is None:
-        return 0
-    vals = np.frombuffer(values, dtype=np.uint8)
-    n = len(ys)
-    image[ys, xs] = vals[:n * _CHANNELS].reshape(n, _CHANNELS)
-    return n * _CHANNELS
-
-
-def build_payload_v2(password: str, masks, original: np.ndarray):
-    """v2 payload：每通道独立 RLE 编码 + 独立原值，头部记录通道数与各段长度。
+def build_payload(password: str, masks, original: np.ndarray):
+    """payload：每通道独立 RLE 编码 + 独立原值，头部记录通道数与各段长度。
 
     各通道编码在线程池中并行（numpy 操作释放 GIL，互不阻塞）。
     返回 (header, segments, directions, n_pixels)：
@@ -372,7 +269,7 @@ def build_payload_v2(password: str, masks, original: np.ndarray):
     n_pixels = [len(v) for v in vals]
 
     header = bytearray(hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii"))
-    header += bytes([PAYLOAD_VERSION_V2, nc]) + bytes(directions)
+    header += bytes([PAYLOAD_VERSION, nc]) + bytes(directions)
     for c in range(nc):
         header += n_pixels[c].to_bytes(4, "big")
     for c in range(nc):
@@ -381,8 +278,8 @@ def build_payload_v2(password: str, masks, original: np.ndarray):
     return bytes(header), segments, directions, n_pixels
 
 
-def parse_payload_v2_streams(data0: bytes, diff_ext: np.ndarray):
-    """从解码端恢复的每通道独立流解析 v2。
+def parse_payload_streams(data0: bytes, diff_ext: np.ndarray):
+    """从解码端恢复的每通道独立流解析。
 
     data0    = 通道 0 流还原的字节（header + 通道 0 段）
     diff_ext = 扩展区 |实际-理论| 数组 (N, nc)，用于取各通道流
@@ -408,7 +305,7 @@ def parse_payload_v2_streams(data0: bytes, diff_ext: np.ndarray):
             if len(bc) < seg_lens[c]:
                 raise ValueError(f"通道 {c} 流不完整")
             seg = bc[:seg_lens[c]]
-        _, entries, end = parse_entries_v2(seg, 0)
+        _, entries, end = parse_entries(seg, 0)
         if end != e_bytes[c]:
             raise ValueError(f"通道 {c} 的 entries 长度不一致（头部 {e_bytes[c]}，实际 {end}）")
         sections.append((entries, seg[e_bytes[c]:]))
@@ -424,28 +321,10 @@ def apply_values_channel(image: np.ndarray, entries, direction: int, values: byt
     image[ys, xs, channel] = vals[:len(ys)]
 
 
-def build_payload(password: str, diff: np.ndarray, original: np.ndarray):
-    """组装 payload：SHA-256(密码) + 版本 + 压缩后的差异记录 + 原像素值。
-
-    横向/纵向两种区间编码选体积较小者。返回 (payload, entries, direction)。
-    """
-    h_entries = scan_runs(diff, 0)
-    v_entries = scan_runs(diff, 1)
-    h_blob = serialize_entries(h_entries, 0)
-    v_blob = serialize_entries(v_entries, 1)
-    if len(h_blob) <= len(v_blob):
-        blob, direction, entries = h_blob, 0, h_entries
-    else:
-        blob, direction, entries = v_blob, 1, v_entries
-    values = serialize_values(original, entries, direction)
-    sha = hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
-    return sha + bytes([PAYLOAD_VERSION]) + blob + values, entries, direction
-
-
 def encode(original_path, coded_path, password=None, output_path=None):
     """编码模式：将原图与处理后图的差异写入处理后图的镜像扩展区。
 
-    v2：每个通道独立检测差异、独立 RLE、独立记录原值；支持 1/3/4 通道
+    每个通道独立检测差异、独立 RLE、独立记录原值；支持 1/3/4 通道
     （灰度/BGR/BGRA），输出保持与输入相同的通道数。
     payload 每字节按位奇偶拆为两个 0~15 的值，按通道线性写入扩展区像素：
     默认对理论镜像值做加法偏移，若加法溢出（>255）则改做减法（差值恒 >=226，
@@ -467,7 +346,7 @@ def encode(original_path, coded_path, password=None, output_path=None):
     height, width = coded.shape[:2]
     nc = coded.shape[2]
     masks = [original[:, :, c] != coded[:, :, c] for c in range(nc)]
-    header, segments, directions, n_pixels = build_payload_v2(password, masks, original)
+    header, segments, directions, n_pixels = build_payload(password, masks, original)
 
     # 每通道独立流：通道 0 流 = header + 段 0，其余通道流 = 各自段；
     # 扩展区大小取所有通道中需求最大者（每像素提供 1 个槽位/通道）
@@ -515,7 +394,7 @@ def decode(coded_path, password=None, output_path=None):
 
     每圈假设下：内部图像按 BORDER_REFLECT_101 重建理论扩展区，
     偏移量 = |实际像素 - 理论像素|（绝对值化，与编码端加减方向无关）。
-    兼容 v1（3 通道整像素原值）与 v2（每通道独立原值）；输出保持输入通道数。
+    每通道独立原值；输出保持输入通道数。
     """
     password = password or DEFAULT_PASSWORD
     img = _imread(coded_path)
@@ -529,8 +408,7 @@ def decode(coded_path, password=None, output_path=None):
     expect = hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
     max_k = (min(eh, ew) - 1) // 2
 
-    payload = None
-    v2_streams = None
+    streams = None
     chosen_k = 0
     for k in range(1, max_k + 1):
         inner = img[k:eh - k, k:ew - k]
@@ -545,46 +423,24 @@ def decode(coded_path, password=None, output_path=None):
         if not diff_ext.any():
             break  # 该圈及更外没有任何偏移，数据不可能在更外层
 
-        # 先试 v1 线性流（整流 ravel 校验）
-        nibbles = diff_ext.ravel()
-        byte_len = len(nibbles) // 2
-        if byte_len >= 64:
-            data = _nibbles_to_bytes(nibbles)
-            if data[:64] == expect:
-                chosen_k = k
-                if data[64] == PAYLOAD_VERSION_V1:
-                    payload = data
-                else:
-                    # nc=1 时线性流与通道 0 流相同，v2 数据会被 v1 校验命中 → 转 v2 路径
-                    v2_streams = (data, diff_ext)
-                break
-
-        # 再试 v2 通道 0 独立流（header 位于通道 0 流开头）
+        # 通道 0 独立流校验（header 位于通道 0 流开头）
         data0 = _nibbles_to_bytes(diff_ext[:, 0])
         if len(data0) >= 64 and data0[:64] == expect:
-            v2_streams = (data0, diff_ext)
+            streams = (data0, diff_ext)
             chosen_k = k
             break
 
-    if payload is None and v2_streams is None:
+    if streams is None:
         raise ValueError("未找到匹配的 SHA-256 校验码（密码错误或图片不是编码产物）")
 
     restored = img[chosen_k:eh - chosen_k, chosen_k:ew - chosen_k].copy()
-    if v2_streams is not None:
-        data0, diff_ext = v2_streams
-        version = data0[64]
-        if version != PAYLOAD_VERSION_V2:
-            raise ValueError(f"不支持的 payload 版本：{version}")
-        nc, directions, sections = parse_payload_v2_streams(data0, diff_ext)
-        _apply_channels_parallel(restored, sections, directions)
-        dirs_str = "/".join("横" if d == 0 else "纵" for d in directions)
-    else:
-        version = payload[64]
-        if version != PAYLOAD_VERSION_V1:
-            raise ValueError(f"不支持的 payload 版本：{version}")
-        direction, entries, pos = parse_entries(payload, 65)
-        apply_values(restored, entries, direction, payload[pos:])
-        dirs_str = f"{direction}"
+    data0, diff_ext = streams
+    version = data0[64]
+    if version != PAYLOAD_VERSION:
+        raise ValueError(f"不支持的 payload 版本：{version}")
+    nc, directions, sections = parse_payload_streams(data0, diff_ext)
+    _apply_channels_parallel(restored, sections, directions)
+    dirs_str = "/".join("横" if d == 0 else "纵" for d in directions)
 
     if ndim == 2:
         restored = restored[:, :, 0]  # 灰度输入 → 灰度输出
