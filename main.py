@@ -39,10 +39,13 @@ class App:
         self.paths = [None, None, None]   # 原图 / 处理后图 / 输出
         self.photos = [None, None, None]  # PhotoImage 引用（防止被 GC 回收）
         self.titles = ["原图（点击选择）", "处理后图（点击选择）", "输出结果"]
+        # 拖放能力取决于根窗口类型（TkinterDnD.Tk 才有 drop_target_register）
+        self.dnd = hasattr(root, "drop_target_register")
 
         self.mode_var = tk.StringVar(value="等待选择图片")
         self.pwd_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="选择图片后自动判定模式（与命令行规则一致）")
+        self.status_var = tk.StringVar(
+            value="选择图片后自动判定模式（与命令行规则一致）" + ("，支持拖入文件" if self.dnd else ""))
 
         self._build_ui()
         self._update_mode()
@@ -74,6 +77,8 @@ class App:
             label.pack(fill=tk.BOTH, expand=True)
             if i < 2:
                 label.bind("<Button-1>", lambda e, idx=i: self._pick(idx))
+                if self.dnd:
+                    self._setup_dnd(label, i)
             self.boxes.append(label)
 
         # 底部：密码 + 开始
@@ -87,6 +92,21 @@ class App:
         # 状态栏
         ttk.Label(self.root, textvariable=self.status_var, anchor=tk.W,
                   padding=(10, 6)).pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _setup_dnd(self, widget, idx):
+        """注册拖放目标：把图片文件拖到展示框即加载。"""
+        from tkinterdnd2 import DND_FILES
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind("<<Drop>>", lambda e, i=idx: self._on_drop(e, i))
+
+    def _on_drop(self, event, idx):
+        """拖放事件：解析文件路径列表，取第一个加载。"""
+        try:
+            files = self.root.tk.splitlist(event.data)
+        except Exception:
+            files = [event.data]
+        if files:
+            self._load(idx, files[0])
 
     def _show(self, idx, img, overlay):
         """把 PIL 图片等比缩放到框内显示。"""
@@ -102,8 +122,11 @@ class App:
             title=f"选择{self.titles[idx]}",
             filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp *.webp"), ("所有文件", "*.*")]
         )
-        if not path:
-            return
+        if path:
+            self._load(idx, path)
+
+    def _load(self, idx, path):
+        """加载图片到指定展示框（点击/拖放共用）。"""
         try:
             img = Image.open(path)
             img.load()
@@ -162,13 +185,17 @@ class App:
 
 
 def run_gui():
-    """无参数时的图形界面入口（tkinter + Pillow）。"""
+    """无参数时的图形界面入口（tkinter + Pillow，可选 TkinterDnD 拖放）。"""
     if not GUI_AVAILABLE:
         print("GUI 模式需要 tkinter，安装方式：\n"
               "  Arch: sudo pacman -S python-tk\n"
               "  Debian/Ubuntu: sudo apt install python3-tk", file=sys.stderr)
         sys.exit(1)
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()  # 支持拖放（XDND）
+    except Exception:
+        root = tk.Tk()          # 降级：仅点击选择
     App(root)
     root.mainloop()
 
