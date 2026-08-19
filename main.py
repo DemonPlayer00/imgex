@@ -39,6 +39,7 @@ class App:
         self.paths = [None, None, None]   # 原图 / 处理后图 / 输出
         self.photos = [None, None, None]  # PhotoImage 引用（防止被 GC 回收）
         self.titles = ["原图（点击选择）", "处理后图（点击选择）", "输出结果"]
+        self.placeholders = ["空白\n（点击选择图片）", "空白\n（点击选择图片）", "空白"]
         # 拖放能力取决于根窗口类型（TkinterDnD.Tk 才有 drop_target_register）
         self.dnd = hasattr(root, "drop_target_register")
 
@@ -69,14 +70,18 @@ class App:
         for i, title in enumerate(self.titles):
             frame = ttk.Frame(cards, relief=tk.GROOVE, borderwidth=2, padding=4)
             frame.grid(row=0, column=i, sticky="nsew", padx=4)
-            ttk.Label(frame, text=title).pack()
+            head = ttk.Frame(frame)
+            head.pack(fill=tk.X)
+            ttk.Label(head, text=title).pack(side=tk.LEFT)
+            ttk.Button(head, text="重置", width=5,
+                       command=lambda idx=i: self._reset(idx)).pack(side=tk.RIGHT)
             # 容器用 Frame（width/height 为像素单位）；Label 的 width/height 是字符单位，
             # 直接设 300 会把窗口撑爆（≈2100px+），只剩第一个框可见
             panel = tk.Frame(frame, width=self.BOX_SIZE, height=self.BOX_SIZE,
                              background="#f0f0f0")
             panel.pack(fill=tk.BOTH, expand=True)
             label = tk.Label(panel, background="#f0f0f0",
-                             text="空白\n（点击选择图片）" if i < 2 else "空白",
+                             text=self.placeholders[i],
                              compound=tk.CENTER)
             label.pack(fill=tk.BOTH, expand=True)
             if i < 2:
@@ -139,6 +144,16 @@ class App:
             return
         self.paths[idx] = path
         self._show(idx, img, "已加载")
+        self._update_mode()
+
+    def _reset(self, idx):
+        """重置指定展示框：清除图像与路径，对应命令行参数随之移除。"""
+        self.paths[idx] = None
+        self.photos[idx] = None
+        self.boxes[idx].config(
+            image="",
+            text=self.placeholders[idx],
+            background="#f0f0f0")
         self._update_mode()
 
     def _update_mode(self):
