@@ -6,6 +6,15 @@ import argparse
 from contextlib import redirect_stdout
 from actions import encode, decode
 
+# Windows 下 stdout/stderr 重定向（管道）时控制台代码页可能是 GBK，
+# 打印中文路径/日志可能 UnicodeEncodeError；errors=replace 兜底不崩溃
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None:
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
 # GUI 依赖条件导入：CLI 模式不要求 tkinter/Pillow 可用
 try:
     import tkinter as tk

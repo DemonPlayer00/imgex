@@ -4,12 +4,37 @@ import os
 import cv2
 import numpy as np
 
+
 # 默认密码（未通过 -p 提供时使用；其 SHA-256 摘要作为写入扩展区的校验码）
 DEFAULT_PASSWORD = "477a3d43f692aeaf1c7f40c0c91bffde3e2e638d8e90c668422373ee82a18521"
 # payload 格式版本（位于 SHA-256 校验码之后，1 字节）
 PAYLOAD_VERSION = 1
 # 每像素参与写入的通道数（BGR）
 _CHANNELS = 3
+
+
+def _imread(path):
+    """读取图片，兼容含中文/非 ASCII 的路径。
+
+    cv2.imread 在 Windows 上走 ANSI API（fopen），非 ASCII 路径会失败返回 None；
+    改为 np.fromfile（宽字符路径）+ imdecode 解码。
+    """
+    data = np.fromfile(path, dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def _imwrite(path, img):
+    """写入图片，兼容含中文/非 ASCII 的路径。
+
+    cv2.imwrite 在 Windows 上同样受 ANSI API 限制；改为 imencode + tofile。
+    """
+    ext = os.path.splitext(path)[1] or ".png"
+    ok, buf = cv2.imencode(ext, img)
+    if ok:
+        buf.tofile(path)
+    return ok
 
 
 def expand_image(image: np.ndarray, border_size: int) -> np.ndarray:
@@ -234,8 +259,8 @@ def encode(original_path, coded_path, password=None, output_path=None):
     不会双向溢出），解码端取 |实际 - 理论| 绝对值即可还原。
     """
     password = password or DEFAULT_PASSWORD
-    original = cv2.imread(original_path)
-    coded = cv2.imread(coded_path)
+    original = _imread(original_path)
+    coded = _imread(coded_path)
     if original is None or coded is None:
         raise ValueError("无法读取图片（路径不存在或格式不支持）")
     if original.shape != coded.shape:
@@ -265,7 +290,7 @@ def encode(original_path, coded_path, password=None, output_path=None):
     expanded[yy, xx] = new_vals
 
     out = output_path or os.path.splitext(coded_path)[0] + "_encoded.png"
-    if not cv2.imwrite(out, expanded):
+    if not _imwrite(out, expanded):
         raise ValueError(f"保存失败：{out}")
 
     print("【编码模式】")
@@ -284,7 +309,7 @@ def decode(coded_path, password=None, output_path=None):
     偏移量 = |实际像素 - 理论像素|（绝对值化，与编码端加减方向无关）。
     """
     password = password or DEFAULT_PASSWORD
-    img = cv2.imread(coded_path)
+    img = _imread(coded_path)
     if img is None:
         raise ValueError("无法读取图片（路径不存在或格式不支持）")
 
@@ -326,7 +351,7 @@ def decode(coded_path, password=None, output_path=None):
     apply_values(restored, entries, direction, payload[pos:])
 
     out = output_path or os.path.splitext(coded_path)[0] + "_decoded.png"
-    if not cv2.imwrite(out, restored):
+    if not _imwrite(out, restored):
         raise ValueError(f"保存失败：{out}")
 
     print("【解码模式】")
