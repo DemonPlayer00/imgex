@@ -129,17 +129,18 @@ def _derive_seed(password: str, tag: bytes) -> int:
 
 
 def _noise_map(height: int, width: int, seed: int) -> np.ndarray:
-    """种子噪声图（0~15，int16）：越靠近边缘值越大，中心为 0。
+    """种子噪声图（0~15，int16）：越靠近边缘值越大，超过对应边 1/4 处衰减为 0。
 
-    距离场取到四边最近距离，线性衰减到中心归零；边缘处保持 0~15 全幅度。
+    距离场取到四边最近距离；衰减距离 = 最近边缘对应维度（水平边→高度，垂直边→宽度）
+    的 1/4，线性衰减到 0；边缘处保持 0~15 全幅度。
     """
     rng = np.random.default_rng(seed)
     noise = rng.integers(0, 16, (height, width), dtype=np.int16)
-    row_d = np.minimum(np.arange(height), np.arange(height - 1, -1, -1))
-    col_d = np.minimum(np.arange(width), np.arange(width - 1, -1, -1))
-    d = np.minimum(row_d[:, None], col_d[None, :])
-    d_max = (min(height, width) // 2) or 1
-    mask = (d_max - d) / d_max
+    dr = np.minimum(np.arange(height), np.arange(height - 1, -1, -1))[:, None]
+    dc = np.minimum(np.arange(width), np.arange(width - 1, -1, -1))[None, :]
+    d = np.minimum(dr, dc)  # 到最近边缘距离
+    d_fade = np.where(dr <= dc, height * 0.25, width * 0.25)  # 最近边缘对应的衰减距离
+    mask = np.clip(1.0 - d / d_fade, 0.0, 1.0)
     return (noise * mask).astype(np.int16)
 
 
