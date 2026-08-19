@@ -1,0 +1,96 @@
+name: build-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (must already exist, e.g. v1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build exe with PyInstaller
+        run: pyinstaller --onefile --name imgex main.py
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgex-windows
+          path: dist/imgex.exe
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build binary with PyInstaller
+        run: pyinstaller --onefile --name imgex main.py
+      - name: Smoke test (round-trip via built binary)
+        run: |
+          python - <<'EOF'
+          import numpy as np, cv2, subprocess
+          rng = np.random.default_rng(0)
+          A = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+          B = A.copy()
+          B[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
+          cv2.imwrite('/tmp/smoke_A.png', A)
+          cv2.imwrite('/tmp/smoke_B.png', B)
+          subprocess.run(['./dist/imgex', '-o', '/tmp/smoke_A.png', '-c', '/tmp/smoke_B.png',
+                          '-p', 'test', '-O', '/tmp/smoke_enc.png'], check=True, capture_output=True)
+          subprocess.run(['./dist/imgex', '-c', '/tmp/smoke_enc.png', '-p', 'test',
+                          '-O', '/tmp/smoke_dec.png'], check=True, capture_output=True)
+          assert np.array_equal(cv2.imread('/tmp/smoke_dec.png'), A), 'round-trip mismatch'
+          print('SMOKE OK: encode/decode round-trip matches original')
+          EOF
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgex-linux
+          path: dist/imgex
+          if-no-files-found: error
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          echo "Releasing tag: $TAG"
+          # create（--generate-notes 自动生成提交摘要）；已存在则改为 upload 兜底
+          gh release create "$TAG" \
+            artifacts/imgex-windows/imgex.exe \
+            artifacts/imgex-linux/imgex \
+            --generate-notes --title "imgex $TAG" \
+          || gh release upload "$TAG" \
+            artifacts/imgex-windows/imgex.exe \
+            artifacts/imgex-linux/imgex
