@@ -1,5 +1,6 @@
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -184,7 +185,7 @@ def serialize_entries(entries, direction: int) -> bytes:
 
 
 def parse_entries(data: bytes, pos: int):
-    """serialize_entries 的逆运算。返回 (direction, entries, 结束位置)。"""
+    """serialize_entries 的逆运算（v1 交错格式）。返回 (direction, entries, 结束位置)。"""
     direction = data[pos]
     pos += 1
     count = int.from_bytes(data[pos:pos + 4], "big")
@@ -206,23 +207,132 @@ def parse_entries(data: bytes, pos: int):
     return direction, entries, pos
 
 
-def _entries_to_coords(entries, direction: int):
-    """把区间列表展开为 (ys, xs) 索引数组（保持区间扫描顺序）。"""
-    ys_list = []
-    xs_list = []
-    for idx, runs in entries:
-        for s, e in runs:
-            if direction == 0:
-                xs = np.arange(s, e + 1, dtype=np.intp)
-                ys = np.full(len(xs), idx, dtype=np.intp)
-            else:
-                ys = np.arange(s, e + 1, dtype=np.intp)
-                xs = np.full(len(ys), idx, dtype=np.intp)
-            ys_list.append(ys)
-            xs_list.append(xs)
-    if not ys_list:
+def parse_entries_v2(data: bytes, pos: int):
+    """v2 段解析（_rle_encode_channel 的分离布局）：
+    方向(1B) + 行数(4B) + 行头区[idx,n_runs]×rows(8B×rows) + run区[s,e]×Σn(8B×Σn)。
+    返回 (direction, entries, 结束位置)。全 numpy 读头区/run区，逐行组装 entries。
+    """
+    direction = data[pos]
+    pos += 1
+    count = int.from_bytes(data[pos:pos + 4], "big")
+    pos += 4
+    hdr = np.frombuffer(data, dtype=">u4", count=2 * count, offset=pos)
+    pos += 8 * count
+    idxs = hdr[0::2]
+    ns = hdr[1::2]
+    total = int(ns.sum())
+    runs = np.frombuffer(data, dtype=">u4", count=2 * total, offset=pos)
+    pos += 8 * total
+    rs = runs[0::2]
+    es = runs[1::2]
+    entries = []
+    off = 0
+    for i in range(count):
+        n = int(ns[i])
+        entries.append((int(idxs[i]), [(int(rs[off + j]), int(es[off + j])) for j in range(n)]))
+        off += n
+    return direction, entries, pos
+
+
+def _coords_from_runs(rows_arr, starts_arr, ends_arr, direction):
+    """把 run 描述（行号/起点列/终点列，均按 run 对齐）展开为 (ys, xs) 索引数组。
+
+    全 numpy 向量化（释放 GIL，供多线程并行）：
+    lens = 各 run 长度；xs 在 run 内连续，用 cumsum 前缀和定位每个像素的列偏移。
+    direction=1 时 rows_arr 是列号、区间沿行方向，交换 ys/xs。
+    """
+    lens = ends_arr - starts_arr + 1
+    total = int(lens.sum())
+    if total == 0:
         return None, None
-    return np.concatenate(ys_list), np.concatenate(xs_list)
+    inner = np.arange(total, dtype=np.intp) - np.repeat(np.cumsum(lens) - lens, lens)
+    xs = inner + np.repeat(starts_arr, lens)
+    ys = np.repeat(rows_arr, lens)
+    if direction == 1:
+        ys, xs = xs, ys
+    return ys, xs
+
+
+def _entries_to_coords(entries, direction: int):
+    """把区间列表展开为 (ys, xs) 索引数组（保持区间扫描顺序）。向量化。"""
+    if not entries:
+        return None, None
+    rows = []
+    starts = []
+    ends = []
+    for idx, runs in entries:
+        n = len(runs)
+        if n == 0:
+            continue
+        rows.extend([idx] * n)
+        starts.extend(s for s, _ in runs)
+        ends.extend(e for _, e in runs)
+    if not rows:
+        return None, None
+    return _coords_from_runs(np.asarray(rows, dtype=np.intp), np.asarray(starts, dtype=np.intp),
+                             np.asarray(ends, dtype=np.intp), direction)
+
+
+def _rle_encode_channel(mask: np.ndarray, plane: np.ndarray):
+    """单通道 RLE 编码：独立检测差异区间 + 序列化 + 原值提取。
+
+    全程 numpy 向量化（np.diff 找 run 边界、大端 tobytes 组装、前缀和展开坐标），
+    不持有 Python GIL，可在线程池中按通道并行。
+    返回 (direction, blob, values_bytes)：direction 取 h/v 体积较小者。
+    """
+    best = None
+    for d in (0, 1):
+        m = mask if d == 0 else mask.T
+        dm = np.diff(m.astype(np.int8), axis=1, prepend=0, append=0)
+        starts = np.argwhere(dm == 1)   # (K, 2)：每 run 起点 (行, 列)
+        ends = np.argwhere(dm == -1)    # (K, 2)：每 run 终点+1
+        k = len(starts)
+        if k == 0:
+            blob = bytes([d]) + b"\x00\x00\x00\x00"
+            values = b""
+        else:
+            rows = starts[:, 0]
+            # ⛔ 行分组必须用布尔比较：np.diff(rows, prepend=-1) 会把相邻自然数行号
+            #（10→11 的 diff=1）误判为新组，导致行头与 run 区错位
+            first = np.flatnonzero(np.concatenate([[True], rows[1:] != rows[:-1]]))
+            row_ids = rows[first]
+            counts = np.diff(np.append(first, k))
+            # 行头区 [idx(4B) + n_runs(4B)] × 行数，run 区 [起点(4B) + 终点(4B)] × K，均大端
+            row_hdr = np.empty((len(row_ids), 2), dtype=">u4")
+            row_hdr[:, 0] = row_ids
+            row_hdr[:, 1] = counts
+            run_arr = np.empty((k, 2), dtype=">u4")
+            run_arr[:, 0] = starts[:, 1]
+            run_arr[:, 1] = ends[:, 1] - 1
+            blob = bytes([d]) + len(row_ids).to_bytes(4, "big") + row_hdr.tobytes() + run_arr.tobytes()
+            # 原值：按 run 顺序展开坐标后取平面值
+            ys, xs = _coords_from_runs(np.repeat(row_ids, counts), starts[:, 1], ends[:, 1] - 1, d)
+            values = plane[ys, xs].tobytes()
+        total = len(blob) + len(values)
+        if best is None or total < best[0]:
+            best = (d, blob, values)
+    return best
+
+
+def _encode_channels_parallel(masks, planes):
+    """各通道独立 RLE 编码，每通道一个线程并行（numpy 操作释放 GIL）。"""
+    nc = len(masks)
+    if nc <= 1:
+        return [_rle_encode_channel(masks[0], planes[0])]
+    with ThreadPoolExecutor(max_workers=nc) as ex:
+        return list(ex.map(lambda c: _rle_encode_channel(masks[c], planes[c]), range(nc)))
+
+
+def _apply_channels_parallel(restored, sections, directions):
+    """各通道独立恢复原值，每通道一个线程并行（不同通道写不同列，无竞争）。"""
+    nc = len(sections)
+    if nc <= 1:
+        entries, values = sections[0]
+        apply_values_channel(restored, entries, directions[0], values, 0)
+        return
+    with ThreadPoolExecutor(max_workers=nc) as ex:
+        list(ex.map(lambda c: apply_values_channel(restored, sections[c][0], directions[c], sections[c][1], c),
+                    range(nc)))
 
 
 def serialize_values(image: np.ndarray, entries, direction: int) -> bytes:
@@ -247,6 +357,7 @@ def apply_values(image: np.ndarray, entries, direction: int, values: bytes):
 def build_payload_v2(password: str, masks, original: np.ndarray):
     """v2 payload：每通道独立 RLE 编码 + 独立原值，头部记录通道数与各段长度。
 
+    各通道编码在线程池中并行（numpy 操作释放 GIL，互不阻塞）。
     返回 (header, segments, directions, n_pixels)：
       header  = SHA-256(64) + version(1) + n_channels(1) + direction_i(1B × n)
                 + n_pixels_i(4B × n) + entries_bytes_i(4B × n)
@@ -254,24 +365,11 @@ def build_payload_v2(password: str, masks, original: np.ndarray):
     每通道独立选择 h/v 方向中体积较小者。
     """
     nc = len(masks)
-    directions = []
-    blobs = []
-    vals = []
-    n_pixels = []
-    for c in range(nc):
-        eh = scan_runs(masks[c], 0)
-        ev = scan_runs(masks[c], 1)
-        bh = serialize_entries(eh, 0)
-        bv = serialize_entries(ev, 1)
-        if len(bh) <= len(bv):
-            d, el, blob = 0, eh, bh
-        else:
-            d, el, blob = 1, ev, bv
-        directions.append(d)
-        blobs.append(blob)
-        v = serialize_values(original[:, :, c], el, d)
-        vals.append(v)
-        n_pixels.append(len(v))
+    results = _encode_channels_parallel(masks, [original[:, :, c] for c in range(nc)])
+    directions = [r[0] for r in results]
+    blobs = [r[1] for r in results]
+    vals = [r[2] for r in results]
+    n_pixels = [len(v) for v in vals]
 
     header = bytearray(hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii"))
     header += bytes([PAYLOAD_VERSION_V2, nc]) + bytes(directions)
@@ -310,7 +408,7 @@ def parse_payload_v2_streams(data0: bytes, diff_ext: np.ndarray):
             if len(bc) < seg_lens[c]:
                 raise ValueError(f"通道 {c} 流不完整")
             seg = bc[:seg_lens[c]]
-        _, entries, end = parse_entries(seg, 0)
+        _, entries, end = parse_entries_v2(seg, 0)
         if end != e_bytes[c]:
             raise ValueError(f"通道 {c} 的 entries 长度不一致（头部 {e_bytes[c]}，实际 {end}）")
         sections.append((entries, seg[e_bytes[c]:]))
@@ -478,8 +576,7 @@ def decode(coded_path, password=None, output_path=None):
         if version != PAYLOAD_VERSION_V2:
             raise ValueError(f"不支持的 payload 版本：{version}")
         nc, directions, sections = parse_payload_v2_streams(data0, diff_ext)
-        for c, (entries, values) in enumerate(sections):
-            apply_values_channel(restored, entries, directions[c], values, c)
+        _apply_channels_parallel(restored, sections, directions)
         dirs_str = "/".join("横" if d == 0 else "纵" for d in directions)
     else:
         version = payload[64]
