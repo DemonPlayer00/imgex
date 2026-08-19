@@ -30,6 +30,33 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
       - name: Build exe with PyInstaller
         run: pyinstaller --onefile --name imgex main.py
+      - name: Smoke test Chinese paths (round-trip via built exe)
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import numpy as np, cv2, os, subprocess
+          from PIL import Image
+          d = os.path.join(os.environ['TEMP'], '图片 测试')
+          os.makedirs(d, exist_ok=True)
+          rng = np.random.default_rng(3)
+          A = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+          B = A.copy()
+          B[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
+          # PIL 支持 Unicode 路径（cv2.imread 不行），用于生成测试图
+          pa = os.path.join(d, '原图A.png')
+          pb = os.path.join(d, '处理后B.png')
+          Image.fromarray(A).save(pa)
+          Image.fromarray(B).save(pb)
+          enc = os.path.join(d, '编码输出.png')
+          dec = os.path.join(d, '解码输出.png')
+          subprocess.run(['./dist/imgex.exe', '-o', pa, '-c', pb, '-p', 'test', '-O', enc],
+                         check=True, capture_output=True)
+          subprocess.run(['./dist/imgex.exe', '-c', enc, '-p', 'test', '-O', dec],
+                         check=True, capture_output=True)
+          got = cv2.imdecode(np.fromfile(dec, dtype=np.uint8), cv2.IMREAD_COLOR)
+          assert np.array_equal(got, A), 'chinese path round-trip mismatch'
+          print('SMOKE OK: chinese-path encode/decode round-trip via exe')
+          EOF
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
