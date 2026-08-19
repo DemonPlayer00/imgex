@@ -54,7 +54,10 @@ jobs:
           subprocess.run(['./dist/imgex.exe', '-c', enc, '-p', 'test', '-O', dec],
                          check=True, capture_output=True)
           got = cv2.imdecode(np.fromfile(dec, dtype=np.uint8), cv2.IMREAD_COLOR)
-          assert np.array_equal(got, A), 'chinese path round-trip mismatch'
+          # 对比基准必须是“读回原图”而非原始数组：PIL 保存为 RGB 序，
+          # 与 cv2 的 BGR 读取存在通道交换，直接比 A 会误报 mismatch
+          pa_ref = cv2.imdecode(np.fromfile(pa, dtype=np.uint8), cv2.IMREAD_COLOR)
+          assert np.array_equal(got, pa_ref), 'chinese path round-trip mismatch'
           print('SMOKE OK: chinese-path encode/decode round-trip via exe')
           EOF
       - name: Upload Windows artifact
