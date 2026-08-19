@@ -424,12 +424,12 @@ def encode(original_path, coded_path, password=None, output_path=None):
 
     expanded = expand_image(coded, k)
 
-    # v3：扩展区理论值 + 偏移（加法溢出转减法，保证不双向溢出）；
+    # v3：扩展区写入 = 理论镜像值 XOR 数据 nibble（与噪声算法规则一致，偏移 ≤15）；
     # 数据从种子起始点环形写入，空闲槽位用原图随机点位字节流填充（消除数据/空洞边界）
     yy, xx = expand_coords(height, width, k)
     n_slots = len(yy)
-    theory_vals = expanded[yy, xx].astype(np.int16)     # (扩展像素, nc)
-    d_img = np.zeros((n_slots, nc), dtype=np.int16)
+    theory_vals = expanded[yy, xx].astype(np.uint8)     # (扩展像素, nc)
+    d_img = np.zeros((n_slots, nc), dtype=np.uint8)
     covered = np.zeros((n_slots, nc), dtype=bool)
     seed_noise = _derive_seed(password, b"noise")
     seed_start = _derive_seed(password, b"start")
@@ -443,9 +443,7 @@ def encode(original_path, coded_path, password=None, output_path=None):
     free = ~covered
     if free.any():
         d_img[free] = _fill_nibbles(original, seed_fill, int(free.sum()))
-    added = theory_vals + d_img
-    new_vals = np.where(added > 255, theory_vals - d_img, added).astype(np.uint8)
-    expanded[yy, xx] = new_vals
+    expanded[yy, xx] = theory_vals ^ d_img  # XOR 自逆，解码端 bitwise_xor 直接恢复 nibble
     # v3：内图边缘加种子噪声（扩展区不加噪，镜像基底不受影响；XOR 低 4 位，偏移 ≤15）
     expanded[k:height + k, k:width + k] = _apply_noise(
         expanded[k:height + k, k:width + k], _noise_map(height, width, seed_noise))
@@ -500,8 +498,8 @@ def decode(coded_path, password=None, output_path=None):
         height, width = inner.shape[:2]
         yy, xx = expand_coords(height, width, k)
 
-        # 向量化收集：全图一次差分 + 扩展区花式索引（行主序，通道连续）
-        diff_ext = cv2.absdiff(img, theory)[yy, xx]
+        # 向量化收集：全图一次 XOR 差分（与写入规则一致，直接恢复写入 nibble）
+        diff_ext = cv2.bitwise_xor(img, theory)[yy, xx]
         if diff_ext.ndim == 1:
             diff_ext = diff_ext[:, None]  # OpenCV 对单通道 (h,w,1) 返回 2D，补回通道维
         if not diff_ext.any():
