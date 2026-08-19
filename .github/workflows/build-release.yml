@@ -76,6 +76,9 @@ jobs:
     needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gh --generate-notes 需要完整 git 历史
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
