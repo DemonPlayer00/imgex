@@ -8,8 +8,8 @@ import numpy as np
 
 # 默认密码（未通过 -p 提供时使用；其 SHA-256 摘要作为写入扩展区的校验码）
 DEFAULT_PASSWORD = "477a3d43f692aeaf1c7f40c0c91bffde3e2e638d8e90c668422373ee82a18521"
-# payload 格式版本（每通道独立编解码）
-PAYLOAD_VERSION = 2
+# payload 格式版本（每通道独立编解码；v3 = 种子噪声 + 随机起始点 + 扩展区全填充）
+PAYLOAD_VERSION = 3
 
 
 def _imread(path):
@@ -119,6 +119,67 @@ def expand_coords(height: int, width: int, k: int):
     yy, xx = np.mgrid[0:eh, 0:ew]
     ext = (yy < k) | (yy >= height + k) | (xx < k) | (xx >= width + k)
     return yy[ext], xx[ext]
+
+
+# ---------- v3：种子噪声 / 随机起始点 / 填充 ----------
+
+def _derive_seed(password: str, tag: bytes) -> int:
+    """从密码派生确定性种子：sha256(password + tag) 前 8 字节。"""
+    return int.from_bytes(hashlib.sha256(password.encode("utf-8") + tag).digest()[:8], "big")
+
+
+def _noise_map(height: int, width: int, seed: int) -> np.ndarray:
+    """种子噪声图（0~15，int16）：越靠近边缘值越大，中心为 0。
+
+    距离场取到四边最近距离，线性衰减到中心归零；边缘处保持 0~15 全幅度。
+    """
+    rng = np.random.default_rng(seed)
+    noise = rng.integers(0, 16, (height, width), dtype=np.int16)
+    row_d = np.minimum(np.arange(height), np.arange(height - 1, -1, -1))
+    col_d = np.minimum(np.arange(width), np.arange(width - 1, -1, -1))
+    d = np.minimum(row_d[:, None], col_d[None, :])
+    d_max = (min(height, width) // 2) or 1
+    mask = (d_max - d) / d_max
+    return (noise * mask).astype(np.int16)
+
+
+def _apply_noise(img: np.ndarray, noise: np.ndarray) -> np.ndarray:
+    """mod-256 加法：v = (v0 + n) mod 256（uint8 环绕，可逆）。"""
+    n = noise.astype(np.uint8)
+    if img.ndim == 3 and n.ndim == 2:
+        n = n[:, :, None]
+    return img + n
+
+
+def _remove_noise(img: np.ndarray, noise: np.ndarray) -> np.ndarray:
+    """mod-256 减法：v0 = (v - n) mod 256。"""
+    n = noise.astype(np.uint8)
+    if img.ndim == 3 and n.ndim == 2:
+        n = n[:, :, None]
+    return img - n
+
+
+def _payload_start(seed: int, n_slots: int) -> int:
+    """种子决定扩展区数据起始偏移（0 <= s < n_slots）。"""
+    if n_slots <= 0:
+        return 0
+    return int(np.random.default_rng(seed).integers(0, n_slots))
+
+
+def _ring_read(diff_ch: np.ndarray, start: int, n_nibbles: int) -> bytes:
+    """从 start 环形读取 n_nibbles 个 nibble 并合并为字节（尾部奇数丢弃）。"""
+    idx = (start + np.arange(n_nibbles, dtype=np.intp)) % len(diff_ch)
+    return _nibbles_to_bytes(diff_ch[idx])
+
+
+def _fill_nibbles(original: np.ndarray, seed: int, n_slots: int) -> np.ndarray:
+    """填充数据：从原图随机起点环形读字节流，每字节拆 2 nibble，取前 n_slots 个。"""
+    flat = original.reshape(-1)
+    rng = np.random.default_rng(seed)
+    p = int(rng.integers(0, flat.size))
+    n_bytes = (n_slots + 1) // 2
+    idx = (p + np.arange(n_bytes, dtype=np.intp)) % flat.size
+    return _payload_to_nibbles(flat[idx].tobytes())[:n_slots]
 
 
 # ---------- RLE 区间 ----------
@@ -278,11 +339,12 @@ def build_payload(password: str, masks, original: np.ndarray):
     return bytes(header), segments, directions, n_pixels
 
 
-def parse_payload_streams(data0: bytes, diff_ext: np.ndarray):
+def parse_payload_streams(data0: bytes, diff_ext: np.ndarray, start: int):
     """从解码端恢复的每通道独立流解析。
 
     data0    = 通道 0 流还原的字节（header + 通道 0 段）
     diff_ext = 扩展区 |实际-理论| 数组 (N, nc)，用于取各通道流
+    start    = v3 数据起始偏移（环形读取）
     返回 (n_channels, directions, [(entries, values), ...])。
     """
     nc = data0[65]
@@ -301,9 +363,7 @@ def parse_payload_streams(data0: bytes, diff_ext: np.ndarray):
                 raise ValueError("通道 0 段不完整")
             seg = data0[Lh:Lh + seg_lens[0]]
         else:
-            bc = _nibbles_to_bytes(diff_ext[:, c])
-            if len(bc) < seg_lens[c]:
-                raise ValueError(f"通道 {c} 流不完整")
+            bc = _ring_read(diff_ext[:, c], start, seg_lens[c] * 2)
             seg = bc[:seg_lens[c]]
         _, entries, end = parse_entries(seg, 0)
         if end != e_bytes[c]:
@@ -360,15 +420,31 @@ def encode(original_path, coded_path, password=None, output_path=None):
 
     expanded = expand_image(coded, k)
 
-    # 向量化写入：扩展区理论值 + 偏移（加法溢出转减法，保证不双向溢出）
+    # v3：扩展区理论值 + 偏移（加法溢出转减法，保证不双向溢出）；
+    # 数据从种子起始点环形写入，空闲槽位用原图随机点位字节流填充（消除数据/空洞边界）
     yy, xx = expand_coords(height, width, k)
+    n_slots = len(yy)
     theory_vals = expanded[yy, xx].astype(np.int16)     # (扩展像素, nc)
-    d_img = np.zeros((len(yy), nc), dtype=np.int16)
+    d_img = np.zeros((n_slots, nc), dtype=np.int16)
+    covered = np.zeros((n_slots, nc), dtype=bool)
+    seed_noise = _derive_seed(password, b"noise")
+    seed_start = _derive_seed(password, b"start")
+    seed_fill = _derive_seed(password, b"fill")
+    start = _payload_start(seed_start, n_slots)
     for c in range(nc):
-        d_img[:nibble_lens[c], c] = _payload_to_nibbles(parts[c])
+        nib = _payload_to_nibbles(parts[c])
+        pos = (start + np.arange(len(nib), dtype=np.intp)) % n_slots
+        d_img[pos, c] = nib
+        covered[pos, c] = True
+    free = ~covered
+    if free.any():
+        d_img[free] = _fill_nibbles(original, seed_fill, int(free.sum()))
     added = theory_vals + d_img
     new_vals = np.where(added > 255, theory_vals - d_img, added).astype(np.uint8)
     expanded[yy, xx] = new_vals
+    # v3：内图边缘加种子噪声（扩展区不加噪，镜像基底不受影响；mod-256 可逆）
+    expanded[k:height + k, k:width + k] = _apply_noise(
+        expanded[k:height + k, k:width + k], _noise_map(height, width, seed_noise))
 
     if orig_ndim == 2:
         expanded = expanded[:, :, 0]  # 灰度输入 → 灰度输出
@@ -410,9 +486,13 @@ def decode(coded_path, password=None, output_path=None):
 
     streams = None
     chosen_k = 0
+    seed_noise = _derive_seed(password, b"noise")
+    seed_start = _derive_seed(password, b"start")
     for k in range(1, max_k + 1):
         inner = img[k:eh - k, k:ew - k]
-        theory = expand_image(inner, k)  # 与 img 同尺寸的理论镜像扩展图
+        # v3：先还原内图噪声（种子噪声 mod-256 减法），再重建理论镜像
+        inner_clean = _remove_noise(inner, _noise_map(inner.shape[0], inner.shape[1], seed_noise))
+        theory = expand_image(inner_clean, k)  # 与 img 同尺寸的理论镜像扩展图
         height, width = inner.shape[:2]
         yy, xx = expand_coords(height, width, k)
 
@@ -423,22 +503,34 @@ def decode(coded_path, password=None, output_path=None):
         if not diff_ext.any():
             break  # 该圈及更外没有任何偏移，数据不可能在更外层
 
-        # 通道 0 独立流校验（header 位于通道 0 流开头）
-        data0 = _nibbles_to_bytes(diff_ext[:, 0])
-        if len(data0) >= 64 and data0[:64] == expect:
-            streams = (data0, diff_ext)
-            chosen_k = k
-            break
+        # v3：通道 0 流从种子起始点环形读取，头部 SHA-256 校验
+        n_slots = len(yy)
+        start = _payload_start(seed_start, n_slots)
+        head = _ring_read(diff_ext[:, 0], start, 150)  # 75 字节 = nc=1 最小头部
+        if len(head) >= 64 and head[:64] == expect:
+            nc = head[65]
+            if 1 <= nc <= 4:
+                Lh = 66 + 9 * nc
+                hbytes = _ring_read(diff_ext[:, 0], start, Lh * 2)
+                n_pixels0 = int.from_bytes(hbytes[66 + nc:66 + nc + 4], "big")
+                e_bytes0 = int.from_bytes(hbytes[66 + 5 * nc:66 + 5 * nc + 4], "big")
+                total0 = Lh + e_bytes0 + n_pixels0
+                data0 = _ring_read(diff_ext[:, 0], start, total0 * 2)
+                streams = (data0, diff_ext)
+                chosen_k = k
+                break
 
     if streams is None:
         raise ValueError("未找到匹配的 SHA-256 校验码（密码错误或图片不是编码产物）")
 
     restored = img[chosen_k:eh - chosen_k, chosen_k:ew - chosen_k].copy()
+    # v3：还原内图种子噪声后再应用差异
+    restored = _remove_noise(restored, _noise_map(restored.shape[0], restored.shape[1], seed_noise))
     data0, diff_ext = streams
     version = data0[64]
     if version != PAYLOAD_VERSION:
         raise ValueError(f"不支持的 payload 版本：{version}")
-    nc, directions, sections = parse_payload_streams(data0, diff_ext)
+    nc, directions, sections = parse_payload_streams(data0, diff_ext, start)
     _apply_channels_parallel(restored, sections, directions)
     dirs_str = "/".join("横" if d == 0 else "纵" for d in directions)
 
