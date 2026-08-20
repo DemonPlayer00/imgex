@@ -129,7 +129,7 @@ jobs:
           def k_from_decode(enc_path):
               r = subprocess.run(['./dist/imgex', '-c', enc_path, '-p', 'test',
                                   '-O', '/tmp/pc_alpha_dec.png'], check=True, capture_output=True)
-              return int(re.search(rb'确认扩展 (\d+) 圈', r.stdout).group(1))
+              return int(re.search(r'确认扩展 (\d+) 圈', r.stdout.decode()).group(1))
           A = np.zeros((64, 64, 4), dtype=np.uint8)
           A[:, :, :3] = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
           A[:, :, 3] = 0
