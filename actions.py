@@ -144,20 +144,34 @@ def _noise_map(height: int, width: int, seed: int) -> np.ndarray:
     return (noise * mask).astype(np.int16)
 
 
-def _apply_noise(img: np.ndarray, noise: np.ndarray) -> np.ndarray:
+def _apply_noise(img: np.ndarray, noise: np.ndarray, protect_alpha: bool = False) -> np.ndarray:
     """XOR 低 4 位：v = v0 XOR n，偏移恒 ≤15（<16），无条件可逆。
 
     不使用 mod-256 加法——v0 接近 255 时环绕会使像素突变（可达 ±241），
     破坏 0~15 微扰伪装；XOR 只翻转低 4 位，高 4 位不变，视觉偏移恒小。
+
+    protect_alpha=True 时跳过末通道（2 通道灰度+alpha / 4 通道 BGRA 的 alpha）：
+    alpha 是透明通道，噪声会造成边缘半透明微扰，保持其逐位不变。
     """
+    if protect_alpha and img.ndim == 3 and img.shape[2] in (2, 4):
+        out = img.copy()
+        out[:, :, :-1] = _apply_noise(img[:, :, :-1], noise)
+        return out
     n = noise.astype(np.uint8)
     if img.ndim == 3 and n.ndim == 2:
         n = n[:, :, None]
     return img ^ n
 
 
-def _remove_noise(img: np.ndarray, noise: np.ndarray) -> np.ndarray:
-    """XOR 自逆：v0 = v XOR n（加噪与去噪同一操作）。"""
+def _remove_noise(img: np.ndarray, noise: np.ndarray, protect_alpha: bool = False) -> np.ndarray:
+    """XOR 自逆：v0 = v XOR n（加噪与去噪同一操作）。
+
+    protect_alpha 语义与 _apply_noise 一致：跳过 alpha 通道（编解码必须对称）。
+    """
+    if protect_alpha and img.ndim == 3 and img.shape[2] in (2, 4):
+        out = img.copy()
+        out[:, :, :-1] = _remove_noise(img[:, :, :-1], noise)
+        return out
     n = noise.astype(np.uint8)
     if img.ndim == 3 and n.ndim == 2:
         n = n[:, :, None]
@@ -411,11 +425,16 @@ def encode(original_path, coded_path, password=None, output_path=None):
     height, width = coded.shape[:2]
     nc = coded.shape[2]
     masks = [original[:, :, c] != coded[:, :, c] for c in range(nc)]
+    # alpha 通道条件保护：原图与处理后图 alpha 逐位一致 ⟹ 禁用对 alpha 通道的一切处理
+    #（不加噪、不写数据、不填充），透明通道全图逐位保留；有 alpha 差异则按常规通道处理
+    alpha_identical = nc in (2, 4) and np.array_equal(original[:, :, nc - 1], coded[:, :, nc - 1])
     header, segments, directions, n_pixels = build_payload(password, masks, original)
 
     # 每通道独立流：通道 0 流 = header + 段 0，其余通道流 = 各自段；
     # 扩展区大小取所有通道中需求最大者（每像素提供 1 个槽位/通道）
     parts = [header + segments[0]] + segments[1:]
+    if alpha_identical:
+        parts[nc - 1] = b""  # alpha 无差异：alpha 列不写入任何数据（解码端从零填充读回空段）
     nibble_lens = [2 * len(p) for p in parts]
     need_pixels = max(nibble_lens)
     k = calc_expand_pixels(width, height, need_pixels)
@@ -442,12 +461,16 @@ def encode(original_path, coded_path, password=None, output_path=None):
         d_img[pos, c] = nib
         covered[pos, c] = True
     free = ~covered
+    if alpha_identical:
+        free[:, nc - 1] = False  # alpha 列保持空白（扩展区也不写填充数据）
     if free.any():
         d_img[free] = _fill_nibbles(original, seed_fill, int(free.sum()))
     expanded[yy, xx] = theory_vals ^ d_img  # XOR 自逆，解码端 bitwise_xor 直接恢复 nibble
     # v3：内图边缘加种子噪声（扩展区不加噪，镜像基底不受影响；XOR 低 4 位，偏移 ≤15）
+    # alpha 逐位一致时禁用（protect_alpha），透明通道保持逐位不变
     expanded[k:height + k, k:width + k] = _apply_noise(
-        expanded[k:height + k, k:width + k], _noise_map(height, width, seed_noise))
+        expanded[k:height + k, k:width + k], _noise_map(height, width, seed_noise),
+        protect_alpha=alpha_identical)
 
     if orig_ndim == 2:
         expanded = expanded[:, :, 0]  # 灰度输入 → 灰度输出
@@ -489,11 +512,14 @@ def decode(coded_path, password=None, output_path=None):
 
     streams = None
     chosen_k = 0
+    start = 0
     seed_noise = _derive_seed(password, b"noise")
     seed_start = _derive_seed(password, b"start")
     for k in range(1, max_k + 1):
         inner = img[k:eh - k, k:ew - k]
-        # v3：先还原内图噪声（种子噪声 XOR 自逆），再重建理论镜像
+        # v3：先还原内图噪声（种子噪声 XOR 自逆），再重建理论镜像。
+        # 扫描阶段统一用「不保护 alpha」假设：噪声还原只影响 alpha 列差分，
+        # channel-0 流（SHA-256 校验依据）不受影响，扩展圈数定位恒正确
         inner_clean = _remove_noise(inner, _noise_map(inner.shape[0], inner.shape[1], seed_noise))
         theory = expand_image(inner_clean, k)  # 与 img 同尺寸的理论镜像扩展图
         height, width = inner.shape[:2]
@@ -513,23 +539,43 @@ def decode(coded_path, password=None, output_path=None):
         if len(head) >= 64 and head[:64] == expect:
             nc = head[65]
             if 1 <= nc <= 4:
-                Lh = 66 + 9 * nc
-                hbytes = _ring_read(diff_ext[:, 0], start, Lh * 2)
-                n_pixels0 = int.from_bytes(hbytes[66 + nc:66 + nc + 4], "big")
-                e_bytes0 = int.from_bytes(hbytes[66 + 5 * nc:66 + 5 * nc + 4], "big")
-                total0 = Lh + e_bytes0 + n_pixels0
-                data0 = _ring_read(diff_ext[:, 0], start, total0 * 2)
-                streams = (data0, diff_ext)
                 chosen_k = k
                 break
 
-    if streams is None:
+    if chosen_k == 0:
         raise ValueError("未找到匹配的 SHA-256 校验码（密码错误或图片不是编码产物）")
 
+    # 解码端通过检查 alpha 通道数值一致性确定是否处理 alpha：
+    # 编码端禁用 alpha 时不在 alpha 列写入任何隐写数据（含校验值），
+    # alpha 通道 = 内图 alpha 的纯镜像扩展 ⟺ 逐位一致；有差异则 alpha 列必然带数据（段计数非零）⟹ 常规处理。
+    # 内容检查不依赖头部元数据，且无需去噪：禁用时内图 alpha 无噪声，扩展区 alpha 就是其镜像。
+    protect_alpha = False
+    if nc in (2, 4):
+        mirror_alpha = cv2.copyMakeBorder(
+            img[chosen_k:eh - chosen_k, chosen_k:ew - chosen_k, nc - 1],
+            chosen_k, chosen_k, chosen_k, chosen_k, cv2.BORDER_REFLECT_101)
+        protect_alpha = np.array_equal(img[:, :, nc - 1], mirror_alpha)
+
+    Lh = 66 + 9 * nc
+    hbytes = _ring_read(diff_ext[:, 0], start, Lh * 2)
+    n_pixels = [int.from_bytes(hbytes[66 + nc + 4 * c:66 + nc + 4 * c + 4], "big") for c in range(nc)]
+    e_bytes = [int.from_bytes(hbytes[66 + 5 * nc + 4 * c:66 + 5 * nc + 4 * c + 4], "big") for c in range(nc)]
+
     restored = img[chosen_k:eh - chosen_k, chosen_k:ew - chosen_k].copy()
-    # v3：还原内图种子噪声后再应用差异
-    restored = _remove_noise(restored, _noise_map(restored.shape[0], restored.shape[1], seed_noise))
-    data0, diff_ext = streams
+    # v3：还原内图种子噪声后再应用差异（alpha 逐位一致时跳过，与编码端对称）
+    restored = _remove_noise(restored, _noise_map(restored.shape[0], restored.shape[1], seed_noise),
+                             protect_alpha=protect_alpha)
+    # 用正确假设重建理论镜像与差分（扫描阶段的 alpha 列在假设不符时无效，仅 channel-0 可信）
+    inner_clean = _remove_noise(img[chosen_k:eh - chosen_k, chosen_k:ew - chosen_k],
+                                _noise_map(restored.shape[0], restored.shape[1], seed_noise),
+                                protect_alpha=protect_alpha)
+    theory = expand_image(inner_clean, chosen_k)
+    yy, xx = expand_coords(restored.shape[0], restored.shape[1], chosen_k)
+    diff_ext = cv2.bitwise_xor(img, theory)[yy, xx]
+    if diff_ext.ndim == 1:
+        diff_ext = diff_ext[:, None]
+    total0 = Lh + e_bytes[0] + n_pixels[0]
+    data0 = _ring_read(diff_ext[:, 0], start, total0 * 2)
     version = data0[64]
     if version != PAYLOAD_VERSION:
         raise ValueError(f"不支持的 payload 版本：{version}")

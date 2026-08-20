@@ -98,7 +98,7 @@ jobs:
       - name: Smoke test per-channel codec (gray/RGBA/channel-independence via built binary)
         run: |
           python - <<'EOF'
-          import numpy as np, cv2, subprocess
+          import numpy as np, cv2, subprocess, re
           rng = np.random.default_rng(1)
 
           def rt(name, A, mod_fn):
@@ -124,6 +124,40 @@ jobs:
           # 单通道独立：只改 R（通道 2），B/G 必须零差异；往返一致
           A = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
           rt('indep', A, lambda B: B[5:15, 5:15, 2].__setitem__(slice(None), B[5:15, 5:15, 2] ^ 0x55))
+
+          # alpha 条件保护：alpha 逐位一致 ⟹ 禁一切处理（全保留）；alpha 有差异 ⟹ 常规处理；往返都必须一致
+          def k_from_decode(enc_path):
+              r = subprocess.run(['./dist/imgex', '-c', enc_path, '-p', 'test',
+                                  '-O', '/tmp/pc_alpha_dec.png'], check=True, capture_output=True)
+              return int(re.search(rb'确认扩展 (\d+) 圈', r.stdout).group(1))
+          A = np.zeros((64, 64, 4), dtype=np.uint8)
+          A[:, :, :3] = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+          A[:, :, 3] = 0
+          A[8:56, 8:56, 3] = 255  # 硬边不透明块（噪声最可见场景）
+          cv2.imwrite('/tmp/pc_alpha_A.png', A)
+          # 场景 1：alpha 一致（只改 RGB）→ 内图 alpha 逐位保留（禁噪），RGB 仍有噪声
+          B1 = A.copy()
+          B1[20:40, 30:50, :3] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
+          cv2.imwrite('/tmp/pc_alpha1_B.png', B1)
+          subprocess.run(['./dist/imgex', '-o', '/tmp/pc_alpha_A.png', '-c', '/tmp/pc_alpha1_B.png',
+                          '-p', 'test', '-O', '/tmp/pc_alpha1_enc.png'], check=True, capture_output=True)
+          k1 = k_from_decode('/tmp/pc_alpha1_enc.png')
+          enc1 = cv2.imread('/tmp/pc_alpha1_enc.png', cv2.IMREAD_UNCHANGED)
+          assert np.array_equal(enc1[k1:64 + k1, k1:64 + k1, 3], B1[:, :, 3]), 'alpha-identical: alpha must be noise-free'
+          assert not np.array_equal(enc1[k1:64 + k1, k1:64 + k1, :3], B1[:, :, :3]), 'alpha-identical: RGB must carry noise'
+          assert np.array_equal(cv2.imread('/tmp/pc_alpha_dec.png', cv2.IMREAD_UNCHANGED), A), 'alpha-identical round-trip mismatch'
+          print('SMOKE OK: alpha identical -> alpha noise/data/fill disabled, round-trip intact')
+          # 场景 2：alpha 有差异（全通道含 alpha）→ 常规处理（alpha 也加噪），往返一致
+          B2 = A.copy()
+          B2[20:40, 30:50] = rng.integers(0, 256, (20, 20, 4), dtype=np.uint8)
+          cv2.imwrite('/tmp/pc_alpha2_B.png', B2)
+          subprocess.run(['./dist/imgex', '-o', '/tmp/pc_alpha_A.png', '-c', '/tmp/pc_alpha2_B.png',
+                          '-p', 'test', '-O', '/tmp/pc_alpha2_enc.png'], check=True, capture_output=True)
+          k2 = k_from_decode('/tmp/pc_alpha2_enc.png')
+          enc2 = cv2.imread('/tmp/pc_alpha2_enc.png', cv2.IMREAD_UNCHANGED)
+          assert not np.array_equal(enc2[k2:64 + k2, k2:64 + k2, 3], B2[:, :, 3]), 'alpha-differs: alpha should carry noise'
+          assert np.array_equal(cv2.imread('/tmp/pc_alpha_dec.png', cv2.IMREAD_UNCHANGED), A), 'alpha-differs round-trip mismatch'
+          print('SMOKE OK: alpha differs -> normal noise on alpha, round-trip intact')
           EOF
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
