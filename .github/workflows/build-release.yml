@@ -30,22 +30,22 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
       - name: Build exe with PyInstaller
         run: pyinstaller --onefile --name imgex main.py
-      - name: Smoke test Chinese paths (round-trip via built exe)
+      - name: Smoke test (Chinese path round-trip via built exe)
         shell: bash
         run: |
-          python - <<'EOF'
+          python - <<'PYEOF'
           import numpy as np, cv2, os, subprocess
           from PIL import Image
           d = os.path.join(os.environ['TEMP'], '图片 测试')
           os.makedirs(d, exist_ok=True)
           rng = np.random.default_rng(3)
-          A = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
-          B = A.copy()
-          B[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
+          img_a = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+          img_b = img_a.copy()
+          img_b[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
           pa = os.path.join(d, '原图A.png')
           pb = os.path.join(d, '处理后B.png')
-          Image.fromarray(A).save(pa)
-          Image.fromarray(B).save(pb)
+          Image.fromarray(img_a).save(pa)
+          Image.fromarray(img_b).save(pb)
           enc = os.path.join(d, '编码输出.png')
           dec = os.path.join(d, '解码输出.png')
           subprocess.run(['./dist/imgex.exe', '-o', pa, '-c', pb, '-p', 'test', '-O', enc],
@@ -53,10 +53,10 @@ jobs:
           subprocess.run(['./dist/imgex.exe', '-c', enc, '-p', 'test', '-O', dec],
                          check=True, capture_output=True)
           got = cv2.imdecode(np.fromfile(dec, dtype=np.uint8), cv2.IMREAD_COLOR)
-          pa_ref = cv2.imdecode(np.fromfile(pa, dtype=np.uint8), cv2.IMREAD_COLOR)
-          assert np.array_equal(got, pa_ref), 'chinese path round-trip mismatch'
-          print('SMOKE OK: chinese-path encode/decode round-trip via exe')
-          EOF
+          ref = cv2.imdecode(np.fromfile(pa, dtype=np.uint8), cv2.IMREAD_COLOR)
+          assert np.array_equal(got, ref), 'Chinese path round-trip mismatch'
+          print('SMOKE OK: Chinese path encode/decode round-trip via built exe')
+          PYEOF
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
@@ -77,21 +77,21 @@ jobs:
         run: pyinstaller --onefile --name imgex main.py
       - name: Smoke test (round-trip via built binary)
         run: |
-          python - <<'EOF'
+          python - <<'PYEOF'
           import numpy as np, cv2, subprocess
           rng = np.random.default_rng(0)
-          A = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
-          B = A.copy()
-          B[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
-          cv2.imwrite('/tmp/smoke_A.png', A)
-          cv2.imwrite('/tmp/smoke_B.png', B)
+          img_a = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+          img_b = img_a.copy()
+          img_b[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
+          cv2.imwrite('/tmp/smoke_A.png', img_a)
+          cv2.imwrite('/tmp/smoke_B.png', img_b)
           subprocess.run(['./dist/imgex', '-o', '/tmp/smoke_A.png', '-c', '/tmp/smoke_B.png',
                           '-p', 'test', '-O', '/tmp/smoke_enc.png'], check=True, capture_output=True)
           subprocess.run(['./dist/imgex', '-c', '/tmp/smoke_enc.png', '-p', 'test',
                           '-O', '/tmp/smoke_dec.png'], check=True, capture_output=True)
-          assert np.array_equal(cv2.imread('/tmp/smoke_dec.png'), A), 'round-trip mismatch'
+          assert np.array_equal(cv2.imread('/tmp/smoke_dec.png'), img_a), 'round-trip mismatch'
           print('SMOKE OK: encode/decode round-trip matches original')
-          EOF
+          PYEOF
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v7
         with:
@@ -112,21 +112,21 @@ jobs:
         run: pyinstaller --onefile --name imgex main.py
       - name: Smoke test (round-trip via built binary)
         run: |
-          python - <<'EOF'
+          python - <<'PYEOF'
           import numpy as np, cv2, subprocess
           rng = np.random.default_rng(0)
-          A = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
-          B = A.copy()
-          B[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
-          cv2.imwrite('/tmp/smoke_A.png', A)
-          cv2.imwrite('/tmp/smoke_B.png', B)
+          img_a = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+          img_b = img_a.copy()
+          img_b[10:30, 20:40] = rng.integers(0, 256, (20, 20, 3), dtype=np.uint8)
+          cv2.imwrite('/tmp/smoke_A.png', img_a)
+          cv2.imwrite('/tmp/smoke_B.png', img_b)
           subprocess.run(['./dist/imgex', '-o', '/tmp/smoke_A.png', '-c', '/tmp/smoke_B.png',
                           '-p', 'test', '-O', '/tmp/smoke_enc.png'], check=True, capture_output=True)
           subprocess.run(['./dist/imgex', '-c', '/tmp/smoke_enc.png', '-p', 'test',
                           '-O', '/tmp/smoke_dec.png'], check=True, capture_output=True)
-          assert np.array_equal(cv2.imread('/tmp/smoke_dec.png'), A), 'round-trip mismatch'
+          assert np.array_equal(cv2.imread('/tmp/smoke_dec.png'), img_a), 'round-trip mismatch'
           print('SMOKE OK: encode/decode round-trip matches original')
-          EOF
+          PYEOF
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v7
         with:
@@ -135,12 +135,9 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [build-windows, build-linux, build-macos]
+    needs: [build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -150,11 +147,9 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
-          echo "Releasing tag: $TAG"
-          # Delete existing release+tag first if present (idempotent)
-          gh release delete "$TAG" --yes 2>/dev/null || true
+          echo "Creating release for tag: $TAG"
           gh release create "$TAG" \
             artifacts/imgex-windows/imgex.exe \
-            artifacts/imgex-linux/imgex \
             artifacts/imgex-macos/imgex \
+            artifacts/imgex-linux/imgex \
             --generate-notes --title "imgex $TAG"
