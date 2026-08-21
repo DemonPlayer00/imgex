@@ -153,9 +153,11 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
           echo "Creating release for tag: $TAG"
-          set -x
           gh release create "$TAG" \
+            --draft --generate-notes --title "imgex $TAG"
+          gh release upload "$TAG" \
             artifacts/imgex-windows/imgex.exe \
             artifacts/imgex-macos/imgex \
             artifacts/imgex-linux/imgex \
-            --generate-notes --title "imgex $TAG" 2>&1
+            --clobber
+          gh release edit "$TAG" --draft=false
