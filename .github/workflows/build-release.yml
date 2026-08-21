@@ -284,4 +284,5 @@ jobs:
           || gh release upload "$TAG" \
             artifacts/imgex-windows/imgex.exe \
             artifacts/imgex-linux/imgex \
-            artifacts/imgex-macos/imgex
+            artifacts/imgex-macos/imgex \
+            --clobber
