@@ -141,6 +141,8 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
+      - name: Inspect downloaded artifacts
+        run: find artifacts -type f -ls
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -148,8 +150,9 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
           echo "Creating release for tag: $TAG"
+          set -x
           gh release create "$TAG" \
             artifacts/imgex-windows/imgex.exe \
             artifacts/imgex-macos/imgex \
             artifacts/imgex-linux/imgex \
-            --generate-notes --title "imgex $TAG"
+            --generate-notes --title "imgex $TAG" 2>&1
