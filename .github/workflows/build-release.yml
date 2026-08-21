@@ -146,18 +146,48 @@ jobs:
           path: artifacts
       - name: Inspect downloaded artifacts
         run: find artifacts -type f -ls
-      - name: Create GitHub Release
+      - name: Create GitHub Release (draft) and upload assets via API
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
+          set -euo pipefail
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
-          echo "Creating release for tag: $TAG"
-          gh release create "$TAG" \
-            --draft --generate-notes --title "imgex $TAG"
-          gh release upload "$TAG" \
-            artifacts/imgex-windows/imgex.exe \
-            artifacts/imgex-macos/imgex \
-            artifacts/imgex-linux/imgex \
-            --clobber
-          gh release edit "$TAG" --draft=false
+          REPO="DemonPlayer00/imgex"
+
+          echo "Creating draft release for tag: $TAG"
+          # Create draft release, capture upload_url
+          API_JSON=$(gh api "repos/${REPO}/releases" \
+            --method POST \
+            --field tag_name="${TAG}" \
+            --field target_commitish="master" \
+            --field name="imgex ${TAG}" \
+            --field draft=true \
+            --field generate_release_notes=true)
+          RELEASE_ID=$(echo "${API_JSON}" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          echo "Release ID: ${RELEASE_ID}"
+
+          upload_asset() {
+            local file="$1"
+            local name="$2"
+            local mime="$3"
+            echo "  Uploading ${name} (${file})..."
+            curl -sS -X POST \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Content-Type: ${mime}" \
+              --data-binary "@${file}" \
+              "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${name}"
+            echo ""
+          }
+
+          upload_asset "artifacts/imgex-windows/imgex.exe" "imgex-windows.exe" "application/vnd.microsoft.portable-executable"
+          upload_asset "artifacts/imgex-macos/imgex"       "imgex-macos"       "application/octet-stream"
+          upload_asset "artifacts/imgex-linux/imgex"       "imgex-linux"       "application/octet-stream"
+
+          echo "Publishing release..."
+          gh api "repos/${REPO}/releases/${RELEASE_ID}" \
+            --method PATCH \
+            --field draft=false
+
+          echo "Release URL: https://github.com/${REPO}/releases/tag/${TAG}"
