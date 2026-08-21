@@ -151,9 +151,10 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
           echo "Releasing tag: $TAG"
+          # Delete existing release+tag first if present (idempotent)
+          gh release delete "$TAG" --yes 2>/dev/null || true
           gh release create "$TAG" \
             artifacts/imgex-windows/imgex.exe \
             artifacts/imgex-linux/imgex \
             artifacts/imgex-macos/imgex \
-            --generate-notes --title "imgex $TAG" \
-            --clobber
+            --generate-notes --title "imgex $TAG"
