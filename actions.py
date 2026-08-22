@@ -1,6 +1,7 @@
 import hashlib
 import os
 import sys
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -10,7 +11,7 @@ import numpy as np
 # 默认密码（未通过 -p 提供时使用；其 SHA-256 摘要作为写入扩展区的校验码）
 DEFAULT_PASSWORD = "477a3d43f692aeaf1c7f40c0c91bffde3e2e638d8e90c668422373ee82a18521"
 # payload 格式版本（每通道独立编解码；v3 = 种子噪声 + 随机起始点 + 扩展区全填充）
-PAYLOAD_VERSION = 3
+PAYLOAD_VERSION = 4
 
 
 def _imread(path):
@@ -354,37 +355,49 @@ def build_payload(password: str, masks, original: np.ndarray):
     for c in range(nc):
         header += n_pixels[c].to_bytes(4, "big")
     for c in range(nc):
-        header += len(blobs[c]).to_bytes(4, "big")
-    segments = [blobs[c] + vals[c] for c in range(nc)]
-    return bytes(header), segments, directions, n_pixels
+        header += len(blobs[c]).to_bytes(4, "big")  # 解压后 RLE entries 字节数（校验/切分用）
+    # v4：每通道整段（RLE entries + 原值）zlib 压缩，header 记录压缩后字节数
+    # 整段压缩比只压 blob 更优（实测不规则差异区可缩至约 1/5）；level=6 平衡速度与体积
+    zsegments = [zlib.compress(blobs[c] + vals[c], 6) for c in range(nc)]
+    for c in range(nc):
+        header += len(zsegments[c]).to_bytes(4, "big")
+    return bytes(header), zsegments, directions, n_pixels
 
 
 def parse_payload_streams(data0: bytes, diff_ext: np.ndarray, start: int):
-    """从解码端恢复的每通道独立流解析。
+    """从解码端恢复的每通道独立流解析（v4：段为 zlib 压缩整段）。
 
-    data0    = 通道 0 流还原的字节（header + 通道 0 段）
+    data0    = 通道 0 流还原的字节（header + 通道 0 压缩段）
     diff_ext = 扩展区 |实际-理论| 数组 (N, nc)，用于取各通道流
-    start    = v3 数据起始偏移（环形读取）
+    start    = v4 数据起始偏移（环形读取）
     返回 (n_channels, directions, [(entries, values), ...])。
+
+    v4 header：SHA(64)+ver(1)+nc(1)+dir(nc)+n_pix(4nc)+e_bytes(4nc)+z_bytes(4nc)。
+    每通道段是压缩后的整段（RLE entries + 原值），先 zlib 解压再用 e_bytes 切分。
     """
     nc = data0[65]
     directions = list(data0[66:66 + nc])
-    Lh = 66 + 9 * nc
+    Lh = 66 + 13 * nc
     if len(data0) < Lh:
         raise ValueError("通道 0 流过短，无法读取头部")
     n_pixels = [int.from_bytes(data0[66 + nc + 4 * c:66 + nc + 4 * c + 4], "big") for c in range(nc)]
     e_bytes = [int.from_bytes(data0[66 + 5 * nc + 4 * c:66 + 5 * nc + 4 * c + 4], "big") for c in range(nc)]
-    seg_lens = [e + n for e, n in zip(e_bytes, n_pixels)]
+    z_bytes = [int.from_bytes(data0[66 + 9 * nc + 4 * c:66 + 9 * nc + 4 * c + 4], "big") for c in range(nc)]
 
     sections = []
     for c in range(nc):
         if c == 0:
-            if len(data0) < Lh + seg_lens[0]:
+            if len(data0) < Lh + z_bytes[0]:
                 raise ValueError("通道 0 段不完整")
-            seg = data0[Lh:Lh + seg_lens[0]]
+            zseg = data0[Lh:Lh + z_bytes[0]]
         else:
-            bc = _ring_read(diff_ext[:, c], start, seg_lens[c] * 2)
-            seg = bc[:seg_lens[c]]
+            zseg = _ring_read(diff_ext[:, c], start, z_bytes[c] * 2)
+        try:
+            seg = zlib.decompress(zseg)
+        except zlib.error as exc:
+            raise ValueError(f"通道 {c} 压缩段解压失败：{exc}")
+        if len(seg) != e_bytes[c] + n_pixels[c]:
+            raise ValueError(f"通道 {c} 解压后长度不一致（期望 {e_bytes[c] + n_pixels[c]}，实际 {len(seg)}）")
         _, entries, end = parse_entries(seg, 0)
         if end != e_bytes[c]:
             raise ValueError(f"通道 {c} 的 entries 长度不一致（头部 {e_bytes[c]}，实际 {end}）")
@@ -613,10 +626,11 @@ def decode(coded_path, password=None, output_path=None, k: int = 0):
             chosen_k, chosen_k, chosen_k, chosen_k, cv2.BORDER_REFLECT_101)
         protect_alpha = np.array_equal(img[:, :, nc - 1], mirror_alpha)
 
-    Lh = 66 + 9 * nc
+    Lh = 66 + 13 * nc  # v4 header：SHA+ver+nc+dir + n_pix(4nc) + e_bytes(4nc) + z_bytes(4nc)
     hbytes = _ring_read(diff_ext[:, 0], start, Lh * 2)
     n_pixels = [int.from_bytes(hbytes[66 + nc + 4 * c:66 + nc + 4 * c + 4], "big") for c in range(nc)]
     e_bytes = [int.from_bytes(hbytes[66 + 5 * nc + 4 * c:66 + 5 * nc + 4 * c + 4], "big") for c in range(nc)]
+    z_bytes = [int.from_bytes(hbytes[66 + 9 * nc + 4 * c:66 + 9 * nc + 4 * c + 4], "big") for c in range(nc)]
 
     restored = img[chosen_k:eh - chosen_k, chosen_k:ew - chosen_k].copy()
     # v3：还原内图种子噪声后再应用差异（alpha 逐位一致时跳过，与编码端对称）
@@ -631,7 +645,7 @@ def decode(coded_path, password=None, output_path=None, k: int = 0):
     diff_ext = cv2.bitwise_xor(img, theory)[yy, xx]
     if diff_ext.ndim == 1:
         diff_ext = diff_ext[:, None]
-    total0 = Lh + e_bytes[0] + n_pixels[0]
+    total0 = Lh + z_bytes[0]  # v4：通道 0 流 = header + 压缩段0
     data0 = _ring_read(diff_ext[:, 0], start, total0 * 2)
     version = data0[64]
     if version != PAYLOAD_VERSION:
