@@ -1,5 +1,6 @@
 import hashlib
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -491,12 +492,92 @@ def encode(original_path, coded_path, password=None, output_path=None):
     print(f"  输出: {out}")
 
 
-def decode(coded_path, password=None, output_path=None):
+def _probe_circle(img, eh, ew, k, seed_noise, seed_start, expect):
+    """对单个候选扩展圈 k 做完整判定（与 decode 原扫描循环单圈逐位一致）。
+
+    返回 (k, empty, hit, start, nc, diff_ext)：
+      empty = 该圈扩展区无任何偏移（原逻辑据此提前 break）
+      hit   = 头部 SHA-256 校验通过（找到数据圈）
+      start = 命中时该圈的起始偏移
+      nc    = 命中时头部通道数（供后续 protect_alpha 判定）
+      diff_ext = 该圈的扩展区差分数组（channel-0 供头部读取，逐位一致）
+    """
+    h, w = eh - 2 * k, ew - 2 * k
+    inner = img[k:eh - k, k:ew - k]
+    inner_clean = _remove_noise(inner, _noise_map(inner.shape[0], inner.shape[1], seed_noise))
+    theory = expand_image(inner_clean, k)
+    yy, xx = expand_coords(h, w, k)
+    diff_ext = cv2.bitwise_xor(img, theory)[yy, xx]
+    if diff_ext.ndim == 1:
+        diff_ext = diff_ext[:, None]
+    if not diff_ext.any():
+        return (k, True, False, 0, 0, diff_ext)
+    n_slots = len(yy)
+    start = _payload_start(seed_start, n_slots)
+    head = _ring_read(diff_ext[:, 0], start, 150)
+    # 命中条件与原循环逐位一致：SHA 校验通过 且 通道数在 1..4 合法范围
+    nc = head[65] if (len(head) > 65) else 0
+    hit = len(head) >= 64 and head[:64] == expect and 1 <= nc <= 4
+    return (k, False, hit, start if hit else 0, nc, diff_ext)
+
+
+def _decode_scan(img, max_k, seed_noise, seed_start, expect, workers=8):
+    """解码扫描：按 k 升序分批，批内多核并行，命中/空圈即早停。
+
+    逐位复刻原串行扫描语义（首个命中圈 k / 起始偏移 / 通道数 nc）：
+      - 更小的空圈（数据不可能更外层）→ 返回未找到（chosen_k=0）。
+      - 首个命中 → 返回该圈及其 diff_ext（channel-0 供头部读取）。
+    workers 默认 8：实测 24 核全开后内存带宽/调度开销反致退化，8 为甜点。
+    """
+    eh, ew = img.shape[:2]
+    k = 1
+    batch = workers
+    while k <= max_k:
+        ks = range(k, min(k + batch, max_k + 1))
+        with ThreadPoolExecutor(max_workers=batch) as ex:
+            results = list(ex.map(
+                lambda kk: _probe_circle(img, eh, ew, kk, seed_noise, seed_start, expect),
+                ks))
+        for (kk, empty, hit, st, nc, de) in results:  # results 与 ks 同序（k 升序）
+            if empty:  # 首个命中前的空圈 → 原串行在此 break → 未找到
+                return (0, 0, 0, None)
+            if hit:
+                return (kk, st, nc, de)
+        k += batch
+    return (0, 0, 0, None)
+
+
+def _scan_with_hint(img, max_k, seed_noise, seed_start, expect, workers=8, hint_k=0):
+    """带扩展圈数提示的解码扫描（decode 的 k 捷径入口）。
+
+    - hint_k>0 且 <=max_k：先直接探查该圈（单圈 O(面积)）。命中即返回，免去逐圈扫描；
+      不命中则输出警告并回退到 _decode_scan 全量扫描（保证仍能正确解码）。
+    - 否则（hint_k=0 或越界）：仅走 _decode_scan。
+    """
+    if hint_k > 0 and hint_k <= max_k:
+        kk, empty, hit, st, nc, de = _probe_circle(
+            img, img.shape[0], img.shape[1], hint_k, seed_noise, seed_start, expect)
+        if hit:
+            return (kk, st, nc, de)
+        # 不命中：输出警告（区分空圈/头部未命中），回退全量扫描
+        if empty:
+            reason = "该圈及更外的扩展区无任何偏移（数据不在指定圈或密码不符）"
+        else:
+            reason = "该圈头部 SHA-256 校验未通过（扩展圈数估计错误或密码不符）"
+        print(f"警告：指定扩展圈数 {hint_k} 未匹配（{reason}），回退逐圈扫描。", file=sys.stderr)
+    return _decode_scan(img, max_k, seed_noise, seed_start, expect, workers=workers)
+
+
+def decode(coded_path, password=None, output_path=None, k: int = 0):
     """解码模式：从外圈向内逐圈测试，SHA-256 校验通过后确认扩展圈数并还原原图。
 
     每圈假设下：内部图像按 BORDER_REFLECT_101 重建理论扩展区，
     偏移量 = |实际像素 - 理论像素|（绝对值化，与编码端加减方向无关）。
     每通道独立原值；输出保持输入通道数。
+
+    k 捷径：若调用方已知扩展圈数，可传 k>0 直接跳到该圈解码，
+    跳过逐圈试探的 O(k·面积) 扫描（大幅提速）。指定圈不命中时输出警告
+    并自动回退到逐圈扫描，保证仍能正确解码。k=0（默认）走逐圈扫描。
     """
     password = password or DEFAULT_PASSWORD
     img = _imread(coded_path)
@@ -511,36 +592,12 @@ def decode(coded_path, password=None, output_path=None):
     max_k = (min(eh, ew) - 1) // 2
 
     streams = None
-    chosen_k = 0
-    start = 0
     seed_noise = _derive_seed(password, b"noise")
     seed_start = _derive_seed(password, b"start")
-    for k in range(1, max_k + 1):
-        inner = img[k:eh - k, k:ew - k]
-        # v3：先还原内图噪声（种子噪声 XOR 自逆），再重建理论镜像。
-        # 扫描阶段统一用「不保护 alpha」假设：噪声还原只影响 alpha 列差分，
-        # channel-0 流（SHA-256 校验依据）不受影响，扩展圈数定位恒正确
-        inner_clean = _remove_noise(inner, _noise_map(inner.shape[0], inner.shape[1], seed_noise))
-        theory = expand_image(inner_clean, k)  # 与 img 同尺寸的理论镜像扩展图
-        height, width = inner.shape[:2]
-        yy, xx = expand_coords(height, width, k)
-
-        # 向量化收集：全图一次 XOR 差分（与写入规则一致，直接恢复写入 nibble）
-        diff_ext = cv2.bitwise_xor(img, theory)[yy, xx]
-        if diff_ext.ndim == 1:
-            diff_ext = diff_ext[:, None]  # OpenCV 对单通道 (h,w,1) 返回 2D，补回通道维
-        if not diff_ext.any():
-            break  # 该圈及更外没有任何偏移，数据不可能在更外层
-
-        # v3：通道 0 流从种子起始点环形读取，头部 SHA-256 校验
-        n_slots = len(yy)
-        start = _payload_start(seed_start, n_slots)
-        head = _ring_read(diff_ext[:, 0], start, 150)  # 75 字节 = nc=1 最小头部
-        if len(head) >= 64 and head[:64] == expect:
-            nc = head[65]
-            if 1 <= nc <= 4:
-                chosen_k = k
-                break
+    # 解码扫描：按 k 升序分批、批内多核并行、命中即早停（逐位复刻原串行语义）。
+    # workers 固定 8：多线程在内存带宽/调度平衡下的实测甜点（24 核全开反退化）。
+    chosen_k, start, nc, diff_ext = _scan_with_hint(
+        img, max_k, seed_noise, seed_start, expect, workers=8, hint_k=k)
 
     if chosen_k == 0:
         raise ValueError("未找到匹配的 SHA-256 校验码（密码错误或图片不是编码产物）")

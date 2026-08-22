@@ -3,7 +3,7 @@ import sys
 import os
 import io
 import argparse
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from actions import encode, decode
 
 # Windows 下 stdout/stderr 重定向（管道）时控制台代码页可能是 GBK，
@@ -54,6 +54,7 @@ class App:
 
         self.mode_var = tk.StringVar(value="等待选择图片")
         self.pwd_var = tk.StringVar()
+        self.k_var = tk.StringVar()  # 解码捷径圈数（空=0 自动逐圈扫描）
         self.status_var = tk.StringVar(
             value="选择图片后自动判定模式（与命令行规则一致）" + ("，支持拖入文件" if self.dnd else ""))
 
@@ -103,13 +104,35 @@ class App:
         ctrl = ttk.Frame(self.root, padding=8)
         ctrl.pack(fill=tk.X)
         ttk.Label(ctrl, text="密码（留空用默认）:").pack(side=tk.LEFT)
-        ttk.Entry(ctrl, textvariable=self.pwd_var, width=40, show="*").pack(side=tk.LEFT, padx=6)
+        ttk.Entry(ctrl, textvariable=self.pwd_var, width=30, show="*").pack(side=tk.LEFT, padx=6)
+        ttk.Label(ctrl, text="圈数(解码捷径,空=自动):").pack(side=tk.LEFT)
+        ttk.Entry(ctrl, textvariable=self.k_var, width=6).pack(side=tk.LEFT, padx=6)
         self.start_btn = ttk.Button(ctrl, text="开始", command=self._start)
         self.start_btn.pack(side=tk.RIGHT)
 
         # 状态栏
         ttk.Label(self.root, textvariable=self.status_var, anchor=tk.W,
                   padding=(10, 6)).pack(fill=tk.X, side=tk.BOTTOM)
+
+    @staticmethod
+    def _fmt_detail(log):
+        """从捕获的 stdout+stderr 提取要点：扩展圈数 + 任何警告。
+        decode 打印『确认扩展 N 圈』(stdout)，警告(_scan_with_hint)走 stderr。"""
+        lines = [l.strip() for l in log.splitlines() if l.strip()]
+        warns = [l for l in lines if "警告" in l]
+        # 扩展圈数：优先『确认扩展 N 圈』(解码)，其次『扩展 N 圈』(编码)
+        ring = next((l for l in lines if "确认扩展" in l), None)
+        if ring is None:
+            ring = next((l for l in lines if "圈" in l and "扩展" in l), None)
+        parts = []
+        if ring:
+            parts.append(ring)
+        else:
+            detail = lines[-1] if lines else ""
+            parts.append(detail)
+        if warns:
+            parts.append("; ".join(warns))
+        return "  |  ".join(parts)
 
     def _setup_dnd(self, widget, idx):
         """注册拖放目标：把图片文件拖到展示框即加载。"""
@@ -186,24 +209,40 @@ class App:
                 "请先选择图片：\n编码 = 原图 + 处理后图\n解码 = 仅编码图（点第二个框）")
             return
         pwd = self.pwd_var.get().strip() or None
+        # 解码捷径圈数：留空=0（自动逐圈扫描），非法输入按 0 处理并提示
+        k = 0
+        if a and b:
+            pass
+        else:
+            k_raw = self.k_var.get().strip()
+            if k_raw:
+                try:
+                    k = int(k_raw)
+                    if k < 0:
+                        k = 0
+                        messagebox.showwarning("圈数", "圈数不能为负，已按自动扫描处理")
+                except ValueError:
+                    messagebox.showwarning("圈数", f"无法解析圈数 {k_raw!r}，已按自动扫描处理")
         self.start_btn.config(state=tk.DISABLED)
         self.status_var.set("处理中…")
         self.root.update_idletasks()
         try:
             buf = io.StringIO()
-            with redirect_stdout(buf):  # GUI 下捕获 print 输出，避免 pythonw 无 stdout 崩溃
+            # 同时捕获 stdout 与 stderr：警告(_scan_with_hint)走 stderr，
+            # 圈数等进度走 stdout，pythonw 无控制台时任一都会崩溃
+            with redirect_stdout(buf), redirect_stderr(buf):
                 if a and b:
                     out = os.path.splitext(b)[0] + "_encoded.png"
                     encode(a, b, pwd, out)
                 else:
                     out = os.path.splitext(b)[0] + "_decoded.png"
-                    decode(b, pwd, out)
+                    decode(b, pwd, out, k=k)
             img = Image.open(out)
             img.load()
             self.paths[2] = out
             self._show(2, img, "输出")
             log = buf.getvalue().strip()
-            detail = log.splitlines()[-1] if log else ""
+            detail = self._fmt_detail(log)
             self.status_var.set(f"完成：{out}  |  {detail}")
         except Exception as e:
             messagebox.showerror("处理失败", str(e))
@@ -243,6 +282,8 @@ def main():
     parser.add_argument('-c', dest='coded', help='处理后的图路径（编码/解码均需提供）')
     parser.add_argument('-p', dest='password', help='密码（可选）')
     parser.add_argument('-O', dest='output', help='输出目标路径（可选）')
+    parser.add_argument('-k', dest='iterations', type=int, default=0,
+                        help='解码捷径：指定已知的扩展圈数，直接跳到该圈解码（可选，0=自动逐圈扫描）')
 
     args = parser.parse_args()
 
@@ -262,7 +303,7 @@ def main():
         encode(args.original, args.coded, args.password, args.output)
     elif args.coded and not args.original:
         # 仅有 -c → 解码模式
-        decode(args.coded, args.password, args.output)
+        decode(args.coded, args.password, args.output, k=args.iterations)
     else:
         # 参数组合无效
         print("错误：无效的参数组合。请参考以下帮助：", file=sys.stderr)
